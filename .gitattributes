@@ -1,0 +1,18 @@
+# 统一换行符：仓库内一律用 LF，检出时按平台自动转换
+* text=auto eol=lf
+
+# Windows 脚本必须保留 CRLF，否则某些环境下无法双击运行
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件不要做任何换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.zip binary
+*.exe binary
+
+# 语言统计：这些目录不计入仓库语言占比
+tests/* linguist-documentation
+tools/* linguist-documentation
