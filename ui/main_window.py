@@ -10,9 +10,10 @@ import os
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QMainWindow,
-                               QMessageBox, QPushButton, QStackedWidget, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QLabel,
+                               QMainWindow, QMessageBox, QPushButton,
+                               QStackedWidget, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from core.task_manager import TaskError, TaskManager
 from database.database import get_database
@@ -119,6 +120,17 @@ class MainWindow(QMainWindow):
         action.triggered.connect(self._show_engine_status)
         tool_menu.addAction(action)
 
+        tool_menu.addSeparator()
+        action = QAction('导出 OCR 训练数据…', self)
+        action.setToolTip('把本次任务的姓名行截图与正确文本导出，供后续微调识别模型')
+        action.triggered.connect(self.export_training_data)
+        tool_menu.addAction(action)
+
+        action = QAction('纠正记忆（统计 / 导出）…', self)
+        action.setToolTip('查看程序从你的人工修改中学到了多少')
+        action.triggered.connect(self.show_correction_stats)
+        tool_menu.addAction(action)
+
         help_menu = self.menuBar().addMenu('帮助(&H)')
         action = QAction('使用说明', self)
         action.triggered.connect(self._show_help)
@@ -137,9 +149,11 @@ class MainWindow(QMainWindow):
         self.ocr_page.back_requested.connect(lambda: self._goto(1))
         self.ocr_page.execute_requested.connect(self.on_execute)
         self.ocr_page.reocr_requested.connect(self.on_reocr)
+        self.ocr_page.force_stop_requested.connect(self.on_force_stop)
 
         self.result_page.pause_requested.connect(self.on_pause)
         self.result_page.cancel_requested.connect(self.on_cancel)
+        self.result_page.force_stop_requested.connect(self.on_force_stop)
         self.result_page.undo_requested.connect(self.on_undo)
         self.result_page.export_requested.connect(self.on_export)
         self.result_page.new_task_requested.connect(self.on_new_task)
@@ -263,12 +277,21 @@ class MainWindow(QMainWindow):
             self.ocr_page.update_record_by_index(event.current - 1)
 
     def _on_ocr_done(self, summary) -> None:
+        was_canceled = bool(self.worker is not None and self.worker.canceled)
         self.ocr_page.set_busy(False)
-        self.ocr_page.end_progress('识别完成')
+        self.ocr_page.end_progress('已强制停止' if was_canceled else '识别完成')
+        self.ocr_page.reset_stop_button()
         self.ocr_page.refresh_records()
-        self._update_status(
-            f'OCR 完成：成功 {summary.ocr_ok}，失败 {summary.ocr_failed}，'
-            f'需人工确认 {summary.needs_review}')
+        if was_canceled:
+            self._update_status(
+                f'已停止：本次完成 {summary.ocr_ok} 张，其余保持未处理')
+            self._append_log(f'识别已停止：成功 {summary.ocr_ok}，'
+                             f'失败 {summary.ocr_failed}，'
+                             f'未处理 {summary.total - summary.ocr_ok - summary.ocr_failed}')
+        else:
+            self._update_status(
+                f'OCR 完成：成功 {summary.ocr_ok}，失败 {summary.ocr_failed}，'
+                f'需人工确认 {summary.needs_review}')
         self.manager.save_to_db('ocr_done')
 
     def on_reocr(self, record) -> None:
@@ -420,6 +443,37 @@ class MainWindow(QMainWindow):
         self._update_status('正在取消…已复制的文件会保留')
         self._append_log('用户请求取消任务…')
 
+    def on_force_stop(self) -> None:
+        """强制停止：直接杀死 OCR 子进程，并让工作线程立刻退出。
+
+        与"取消任务"的区别：
+        - 取消是温和的：处理完当前这一张再停；
+        - 强制停止是立即的：后台识别进程直接结束，当前这张的结果丢失。
+        两者都不会删除任何已写入的文件。
+        """
+        if self.worker is None or not self.worker.isRunning():
+            self._append_log('当前没有正在运行的任务，无需停止')
+            return
+
+        stopped = False
+        if self.manager is not None:
+            try:
+                stopped = self.manager.force_stop()
+            except Exception as exc:
+                self._append_log(f'强制停止时出错：{exc}')
+
+        self.worker.cancel()          # 置位取消事件，循环下一次检查即退出
+        self.ocr_page.set_stopping()
+
+        if stopped:
+            self._update_status('已强制停止：后台 OCR 进程已终止')
+            self._append_log('⛔ 用户强制停止：已终止 OCR 子进程，'
+                             '已完成的文件结果保留')
+        else:
+            self._update_status('已请求停止，正在退出当前步骤…')
+            self._append_log('用户强制停止：当前阶段正在收尾退出'
+                             '（复制/扫描会在当前文件结束后停止）')
+
     def on_undo(self) -> None:
         if self.manager is None or self.manager.task_id is None or not self._idle():
             QMessageBox.information(self, '无法撤销', '当前没有可撤销的任务。')
@@ -531,6 +585,102 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes)
             return answer == QMessageBox.StandardButton.Yes
         return True
+
+    # ================================================================ 学习 / 导出
+
+    def export_training_data(self) -> None:
+        """导出本次任务的 OCR 训练数据。"""
+        if self.manager is None or not self.manager.records:
+            QMessageBox.information(self, '没有可导出的数据',
+                                    '请先扫描并完成 OCR，再来导出训练数据。')
+            return
+        if not self._idle():
+            return
+
+        out_dir = QFileDialog.getExistingDirectory(
+            self, '选择训练数据保存位置', self.task_config.output.output_dir or '')
+        if not out_dir:
+            return
+
+        try:
+            stats = self.manager.export_training_data(out_dir)
+        except Exception as exc:
+            logger.exception('导出训练数据失败')
+            QMessageBox.critical(self, '导出失败', str(exc))
+            return
+
+        lines = [
+            f'导出完成：<b>{stats["exported"]}</b> 条样本（候选 {stats["total"]} 条）',
+            f'保存位置：{stats["root"]}',
+            '',
+        ]
+        if stats['no_line']:
+            lines.append(f'· {stats["no_line"]} 条：名字是手工输入的，'
+                         f'在 OCR 文本里找不到，无法定位裁剪行')
+        if stats['no_box']:
+            lines.append(f'· {stats["no_box"]} 条：该行没有可用的文本框')
+        if stats['no_text']:
+            lines.append(f'· {stats["no_text"]} 条：没有 OCR 文本')
+        lines.append('')
+        lines.append('训练前请先打开 review.csv 核对"训练标签"——'
+                     '这些是给模型当标准答案用的，错一条就教坏一条。')
+
+        box = QMessageBox(self)
+        box.setWindowTitle('训练数据已导出')
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText('<br>'.join(lines))
+        open_button = box.addButton('打开目录', QMessageBox.ButtonRole.AcceptRole)
+        box.addButton('知道了', QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is open_button:
+            file_utils.open_in_explorer(stats['root'])
+
+    def show_correction_stats(self) -> None:
+        """展示纠正记忆的统计，并支持导出。"""
+        if self.manager is None:
+            QMessageBox.information(self, '暂无记忆',
+                                    '纠正记忆随任务建立。先完成一次任务再来查看。')
+            return
+        stats = self.manager.correction_stats()
+        count = stats.get('count', 0)
+        fields = stats.get('fields', {})
+
+        lines = ['<b>纠正记忆</b>：程序从你的人工修改中学到的内容。<br>',
+                 '它只对<b>完全相同的 OCR 文本</b>自动生效——'
+                 '重新扫描同一批文件、或同一份文件再次识别时会直接沿用，'
+                 '不会去猜相似但不同的文档。', '']
+        if count:
+            lines.append(f'已记录 <b>{count}</b> 条修正：')
+            for name, number in fields.items():
+                lines.append(f'· {name}：{number} 条')
+            lines.append('')
+            lines.append('记录保存在本机 SQLite 数据库，不会上传。')
+        else:
+            lines.append('还没有记录。你在第 3 步手工修改名字时，'
+                         '差异会自动记下来。')
+
+        box = QMessageBox(self)
+        box.setWindowTitle('纠正记忆')
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText('<br>'.join(lines))
+        export_button = None
+        if count:
+            export_button = box.addButton('导出 CSV', QMessageBox.ButtonRole.ActionRole)
+        box.addButton('关闭', QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+        if export_button is not None and box.clickedButton() is export_button:
+            path, _ = QFileDialog.getSaveFileName(
+                self, '导出纠正记忆', os.path.join(
+                    self.task_config.output.output_dir or os.path.expanduser('~'),
+                    '纠正记忆.csv'), 'CSV 文件 (*.csv)')
+            if path:
+                try:
+                    self.manager.correction_memory.export_csv(path)
+                    QMessageBox.information(self, '导出完成', f'已保存到：\n{path}')
+                    file_utils.open_in_explorer(os.path.dirname(path))
+                except Exception as exc:
+                    QMessageBox.warning(self, '导出失败', str(exc))
 
     def _show_engine_status(self) -> None:
         from ocr.engine import engine_status

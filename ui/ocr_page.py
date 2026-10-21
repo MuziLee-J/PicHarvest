@@ -27,6 +27,7 @@ class OcrPage(QWidget):
     execute_requested = Signal(bool)          # include_unreviewed
     reocr_requested = Signal(object)          # ImageRecord
     accept_all_requested = Signal()
+    force_stop_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -66,9 +67,19 @@ class OcrPage(QWidget):
         self.progress_label.setObjectName('hint')
         self.progress_label.setMinimumWidth(280)
         progress_row.addWidget(self.progress_label)
+
+        self.force_stop_button = QPushButton('强制停止')
+        self.force_stop_button.setObjectName('danger')
+        self.force_stop_button.setToolTip(
+            '立即结束正在进行的 OCR：后台识别进程会被直接终止。\n'
+            '已经识别完的文件保留结果。')
+        self.force_stop_button.clicked.connect(self.force_stop_requested.emit)
+        progress_row.addWidget(self.force_stop_button)
+
         layout.addLayout(progress_row)
         self.progress.setVisible(False)
         self.progress_label.setVisible(False)
+        self.force_stop_button.setVisible(False)
 
         # 工具条
         tools = QHBoxLayout()
@@ -404,12 +415,17 @@ class OcrPage(QWidget):
                        self.retry_failed_button, self.reocr_button):
             widget.setEnabled(not busy)
         self.execute_button.setText('正在处理…' if busy else '确认并执行复制 →')
+        if not busy:
+            self.force_stop_button.setVisible(False)
+            self.reset_stop_button()
 
     # ================================================================ 进度
 
     def start_progress(self, total: int, message: str = '正在识别…') -> None:
         self.progress.setVisible(True)
         self.progress_label.setVisible(True)
+        self.force_stop_button.setVisible(True)
+        self.force_stop_button.setEnabled(True)
         self.progress.setRange(0, max(1, total))
         self.progress.setValue(0)
         self.progress_label.setText(message)
@@ -424,3 +440,14 @@ class OcrPage(QWidget):
         self.progress_label.setText(message)
         self.progress.setVisible(False)
         self.progress_label.setVisible(False)
+        self.force_stop_button.setVisible(False)
+
+    def set_stopping(self) -> None:
+        """强制停止已发出：给出即时反馈并禁用按钮，避免重复点击。"""
+        self.force_stop_button.setEnabled(False)
+        self.force_stop_button.setText('正在停止…')
+        self.progress_label.setText('正在强制停止…')
+
+    def reset_stop_button(self) -> None:
+        self.force_stop_button.setEnabled(True)
+        self.force_stop_button.setText('强制停止')

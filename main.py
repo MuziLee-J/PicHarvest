@@ -182,6 +182,73 @@ def run_selftest() -> int:
 
         check('可用 OCR 引擎', engine_status)
 
+        # ---- 子进程隔离与强制停止（打包后最容易出问题的一环） ----
+        def make_dense_image() -> str:
+            """生成一张内容密集的大图，让单张识别稳定耗时 2 秒以上。
+
+            自检必须可重复：如果图太小，识别会在取消信号到达前就跑完，
+            测试会"假失败"。这里用 24 行文字的 2600×1900 图片，
+            实测识别约 4.5 秒，取消窗口足够大。
+            """
+            from PIL import Image, ImageDraw, ImageFont
+            path = os.path.join(temp_dir, 'selftest_dense.jpg')
+            image = Image.new('RGB', (2600, 1900), 'white')
+            draw = ImageDraw.Draw(image)
+            font = ImageFont.load_default()
+            for candidate in (r'C:\Windows\Fonts\msyh.ttc',
+                              r'C:\Windows\Fonts\simhei.ttf'):
+                if os.path.isfile(candidate):
+                    try:
+                        font = ImageFont.truetype(candidate, 40)
+                        break
+                    except Exception:
+                        pass
+            for i in range(24):
+                draw.text((60, 40 + i * 74),
+                          f'姓名：张三{i:02d}  性别：男  编号：CASE{i:03d}',
+                          fill='black', font=font)
+            image.save(path, 'JPEG', quality=92)
+            return path
+
+        def process_isolation():
+            import threading
+            import time as _time
+
+            from ocr.process_engine import ProcessOcrEngine
+
+            engine = ProcessOcrEngine(prefer='auto', startup_timeout=120)
+            try:
+                ok, error = engine.start()
+                if not ok:
+                    raise RuntimeError(f'子进程启动失败：{error}')
+
+                # 1) 协议正确性：小图应能正常返回结果
+                result = engine.recognize_path(image_path, preset='standard',
+                                               timeout=60)
+                if not result.text.strip():
+                    raise RuntimeError(f'子进程识别失败：{result.error}')
+
+                # 2) 强制停止：大图识别中取消
+                dense = make_dense_image()
+                cancel = threading.Event()
+                threading.Timer(0.3, cancel.set).start()
+                started = _time.time()
+                canceled = engine.recognize_path(dense, preset='standard',
+                                                 timeout=120,
+                                                 cancel_event=cancel)
+                elapsed = _time.time() - started
+                if not canceled.canceled:
+                    raise RuntimeError('强制停止未生效（识别可能已提前完成）')
+                if elapsed > 2.0:
+                    raise RuntimeError(f'强制停止耗时过长：{elapsed:.1f}s')
+                if engine.is_alive():
+                    raise RuntimeError('强制停止后子进程仍然存活')
+                return f'已终止（{elapsed:.2f}s）'
+            finally:
+                engine.release()
+
+        check('子进程隔离与强制停止', process_isolation)
+
     except Exception as exc:
         lines.append(f'[FAIL] 自检过程异常：{exc}')
         problems.append('自检过程')
@@ -221,6 +288,11 @@ def run_selftest() -> int:
 def main(argv: list[str] | None = None) -> int:
     prepare_environment()
     argv = argv if argv is not None else sys.argv
+
+    # OCR 子进程模式：必须在导入 Qt 之前分流，子进程里不创建任何界面
+    if '--ocr-worker' in argv:
+        from ocr.worker_process import main as worker_main
+        return worker_main()
 
     if '--selftest' in argv:
         return run_selftest()

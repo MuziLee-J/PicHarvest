@@ -50,7 +50,16 @@ class TaskManager:
         self.task_id: int | None = None
         self._engine = None
         self._engine_key = ''
+        self._using_process = False
         self._lock = threading.RLock()
+        # 纠正记忆：把用户的人工修正变成下一次的自动判断依据
+        self.correction_memory = None
+        if database is not None:
+            try:
+                from core.correction_memory import CorrectionMemory
+                self.correction_memory = CorrectionMemory(database)
+            except Exception as exc:      # 记忆功能不可用不应影响主流程
+                logger.warning('纠正记忆初始化失败：%s', exc)
 
     # ================================================================ 扫描
 
@@ -104,25 +113,84 @@ class TaskManager:
     # ================================================================ OCR
 
     def ensure_engine(self):
-        """获取（并按需加载）OCR 引擎。"""
+        """获取（并按需加载）OCR 引擎。
+
+        use_process=True 时返回子进程代理引擎 —— 只有它才能被真正强制停止。
+        """
         with self._lock:
-            key = self.config.ocr.engine
-            if self._engine is None or self._engine_key != key:
-                self._engine = get_engine(key)
-                self._engine_key = key
+            cfg = self.config.ocr
+            key = (cfg.engine, cfg.use_process, cfg.rec_model_path,
+                   cfg.det_model_path, cfg.startup_timeout)
+            if self._engine is not None and self._engine_key == key:
+                return self._engine
+
+            self._engine = None
+            self._engine_key = key
+            self._using_process = False
+
+            if cfg.use_process and cfg.engine != 'none':
+                try:
+                    from ocr.process_engine import ProcessOcrEngine
+                    self._engine = ProcessOcrEngine(
+                        prefer=cfg.engine,
+                        rec_model_path=cfg.rec_model_path,
+                        det_model_path=cfg.det_model_path,
+                        startup_timeout=cfg.startup_timeout)
+                    self._using_process = True
+                    return self._engine
+                except Exception as exc:
+                    logger.warning('子进程 OCR 初始化失败，退回进程内模式：%s', exc)
+
+            self._engine = get_engine(
+                cfg.engine, rec_model_path=cfg.rec_model_path,
+                det_model_path=cfg.det_model_path)
             return self._engine
 
     @property
     def engine_name(self) -> str:
         try:
-            return self.ensure_engine().display_name
+            engine = self.ensure_engine()
+            if self._using_process:
+                return f'{getattr(engine, "engine_label", engine.display_name)}（子进程）'
+            return engine.display_name
         except Exception:
             return '未知引擎'
 
+    @property
+    def uses_process_ocr(self) -> bool:
+        return self._using_process
+
+    def force_stop(self) -> bool:
+        """强制停止正在进行的识别。
+
+        对子进程引擎：直接 kill，正在跑的推理立即结束。
+        返回是否确实终止了子进程（进程内模式无法强杀，返回 False）。
+        """
+        engine = self._engine
+        if engine is not None and hasattr(engine, 'force_stop'):
+            try:
+                stopped = engine.force_stop()
+                if self.log:
+                    self.log.warn('已强制停止 OCR 子进程' if stopped
+                                  else '强制停止：当前没有正在运行的 OCR 子进程')
+                return bool(stopped)
+            except Exception as exc:
+                logger.warning('强制停止失败：%s', exc)
+        if self.log:
+            self.log.warn('当前为进程内 OCR 模式，无法强制终止正在进行的单张识别')
+        return False
+
     def release_engine(self) -> None:
         with self._lock:
+            engine = self._engine
             self._engine = None
             self._engine_key = ''
+            self._using_process = False
+        try:
+            if engine is not None:
+                engine.release()
+        except Exception:
+            pass
         reset_engines()
 
     def run_ocr(self,
@@ -139,13 +207,32 @@ class TaskManager:
         summary = TaskSummary(started_at=time.time(), total=len(targets), selected=len(targets))
 
         engine = self.ensure_engine()
-        try:
-            engine.load()
-        except Exception as exc:
-            raise TaskError(f'OCR 引擎加载失败：{exc}') from exc
+
+        # 子进程模式：启动并等待模型就绪；失败则退回进程内模式
+        if self.uses_process_ocr:
+            if self.log:
+                self.log.info('正在启动 OCR 子进程（首次需加载模型，请稍候）…')
+            ok, error = engine.start()
+            if not ok:
+                if self.log:
+                    self.log.warn(f'OCR 子进程启动失败，改用进程内模式：{error}')
+                cfg = self.config.ocr
+                self._engine = get_engine(cfg.engine,
+                                          rec_model_path=cfg.rec_model_path,
+                                          det_model_path=cfg.det_model_path)
+                self._using_process = False
+                engine = self._engine
+
+        if not self.uses_process_ocr:
+            try:
+                engine.load()
+            except Exception as exc:
+                raise TaskError(f'OCR 引擎加载失败：{exc}') from exc
 
         if self.log:
-            self.log.info(f'开始 OCR：引擎={engine.display_name}，待处理 {len(targets)} 张')
+            self.log.info(f'开始 OCR：引擎={self.engine_name}，待处理 {len(targets)} 张')
+            if self.uses_process_ocr:
+                self.log.info('已启用子进程隔离：可随时强制停止，单张超时会自动终止')
 
         suggester = NameSuggester(self.config.naming)
         cancel_event = cancel_event or threading.Event()
@@ -164,11 +251,16 @@ class TaskManager:
 
             done += 1
             started = time.time()
-            self._ocr_and_name(record, engine, suggester)
+            self._ocr_and_name(record, engine, suggester, cancel_event)
             record.ocr_done = record.ocr_done or bool(record.ocr_text)
             elapsed = time.time() - started
 
-            if elapsed > self.config.ocr.timeout_sec:
+            if record.status == Status.CANCELED:
+                if self.log:
+                    self.log.warn('识别已被用户强制停止，剩余文件保持未处理状态')
+                break
+
+            if elapsed > self.config.ocr.timeout_sec and not self.uses_process_ocr:
                 if self.log:
                     self.log.warn(f'单张 OCR 耗时 {elapsed:.1f} 秒，超过设定阈值 '
                                   f'{self.config.ocr.timeout_sec} 秒：{record.source_path}')
@@ -213,13 +305,29 @@ class TaskManager:
             return [r for r in records if not r.ocr_done or r.ocr_error]
         return [r for r in records if r.status != Status.SKIPPED]
 
-    def _ocr_and_name(self, record: ImageRecord, engine, suggester: NameSuggester) -> None:
-        """对单个文件执行 OCR + 命名。异常全部内部消化。"""
+    def _ocr_and_name(self, record: ImageRecord, engine, suggester: NameSuggester,
+                      cancel_event=None) -> None:
+        """对单个文件执行 OCR + 命名。异常全部内部消化。
+
+        注意：识别走 recognize_path()，子进程引擎会把整个推理放进子进程，
+        因此 cancel_event 一置位就能立刻杀死进程，不必等当前图片跑完。
+        """
         record.ocr_error = None
+        cfg = self.config.ocr
+
         try:
-            image = self._load_for_ocr(record.source_path)
+            result = engine.recognize_path(
+                record.source_path,
+                preset=cfg.preprocess,
+                max_side=cfg.max_side,
+                timeout=cfg.timeout_sec,
+                cancel_event=cancel_event,
+            )
         except Exception as exc:
-            record.ocr_error = f'图片读取失败：{exc}'
+            result = None
+            record.ocr_error = f'OCR 调用异常：{exc}'
+
+        if result is None:
             record.ocr_text = ''
             record.extracted_name = ''
             record.status = Status.NEEDS_REVIEW
@@ -227,23 +335,29 @@ class TaskManager:
             self._log_ocr(record)
             return
 
-        try:
-            result = engine.recognize(image)
-        except Exception as exc:
-            record.ocr_error = f'OCR 异常：{exc}'
+        if result.canceled:
+            record.status = Status.CANCELED
+            record.error = '已强制停止'
             record.ocr_text = ''
             record.extracted_name = ''
-            record.status = Status.NEEDS_REVIEW
-            record.error = record.ocr_error
             self._log_ocr(record)
             return
-        finally:
-            del image
 
         record.ocr_engine = result.engine
         record.ocr_confidence = result.avg_confidence
         record.ocr_text = result.text or ''
         record.ocr_error = result.error or None
+        record.ocr_boxes = list(result.boxes or [])
+        record.ocr_image_size = tuple(result.image_size or (0, 0))
+
+        if not record.ocr_text.strip():
+            record.extracted_name = ''
+            record.extract_method = ''
+            record.extract_reason = ''
+            record.status = Status.NEEDS_REVIEW
+            record.error = record.ocr_error or '未识别到任何文字'
+            self._log_ocr(record)
+            return
 
         # 解析 + 命名（指定字段 → AI → 人工）
         parse_result = parse_ocr_text(record.ocr_text, self.config.naming.fields,
@@ -252,13 +366,41 @@ class TaskManager:
         suggestion = suggester.suggest(record.ocr_text,
                                        field_hits=parse_result.fields,
                                        confidences=result.scores)
+        suggestion = self._apply_correction_memory(record, suggestion)
         self._apply_suggestion(record, suggestion)
         self._log_ocr(record)
+
+    def _apply_correction_memory(self, record: ImageRecord, suggestion):
+        """历史修正记忆：只对"完全相同的 OCR 文本"自动生效。
+
+        刻意不做模糊匹配 —— 同一套表单换个姓名时，两段 OCR 文本相似度
+        高达 99%，模糊匹配会把上一个人的名字安到这个人头上。
+        人工修正只该在"确实是同一份内容"时复用。
+        """
+        memory = self.correction_memory
+        if memory is None or not record.ocr_text:
+            return suggestion
+
+        field = (self.config.naming.fields or [''])[0]
+        hit = memory.lookup(record.ocr_text, field)
+        if not hit or not hit.ok:
+            return suggestion
+
+        from ocr.suggester import Suggestion
+        return Suggestion(
+            name=hit.name,
+            confidence=1.0,
+            method=ExtractMethod.LEARNED,
+            reason=(f'历史修正记忆：相同文本此前已人工修正为「{hit.name}」'
+                    f'（{hit.use_count} 次）'),
+            reliable=True,
+        )
 
     def _apply_suggestion(self, record: ImageRecord, suggestion) -> None:
         """把建议写回记录并决定状态。"""
         name = (suggestion.name or '').strip()
         record.extracted_name = name
+        record.ocr_predicted_name = name      # 系统原始建议（人工修改前的值）
         record.extract_method = suggestion.method or ''
         record.extract_reason = suggestion.reason or ''
 
@@ -307,15 +449,49 @@ class TaskManager:
 
     # ================================================================ 命名
 
-    def set_manual_name(self, record: ImageRecord, name: str) -> None:
-        """人工指定名称（采用）。"""
-        record.extracted_name = (name or '').strip()
+    def set_manual_name(self, record: ImageRecord, name: str,
+                        remember: bool = True) -> None:
+        """人工指定名称（采用）。
+
+        如果这次输入与系统建议不同，就是一次"修正"——记入纠正记忆，
+        下次遇到完全相同的 OCR 文本会自动沿用。
+        """
+        name = (name or '').strip()
+        previous = (record.extracted_name or '').strip()
+
+        record.extracted_name = name
         record.extract_method = ExtractMethod.MANUAL
         record.extract_reason = '人工确认/修改'
         record.manual_override = True
         record.status = Status.READY if record.extracted_name else Status.NEEDS_REVIEW
         if record.status == Status.READY:
             record.error = None
+
+        if remember and name and name != previous and record.ocr_text:
+            self.remember_correction(record, previous, name)
+
+    def remember_correction(self, record: ImageRecord, suggested: str,
+                            corrected: str) -> bool:
+        """把一次人工修正写入记忆库。"""
+        if self.correction_memory is None:
+            return False
+        field = (self.config.naming.fields or [''])[0]
+        saved = self.correction_memory.remember(
+            ocr_text=record.ocr_text,
+            field=field,
+            suggested=suggested,
+            corrected=corrected,
+            source_folder=record.source_folder,
+        )
+        if saved and self.log:
+            self.log.info(f'已记录修正："{suggested or "(无)"}" -> "{corrected}"'
+                          f'（字段 {field or "未指定"}）')
+        return saved
+
+    def correction_stats(self) -> dict:
+        if self.correction_memory is None:
+            return {'count': 0, 'fields': {}}
+        return self.correction_memory.stats()
 
     def set_final_filename(self, record: ImageRecord, filename: str) -> None:
         """人工直接指定最终文件名（优先级最高）。"""
@@ -447,6 +623,19 @@ class TaskManager:
             for path in paths:
                 self.log.info(f'报告已生成：{path}')
         return paths
+
+    def export_training_data(self, out_dir: str) -> dict:
+        """导出本次任务的 OCR 训练数据（单行截图 + 标签）。"""
+        from reports.training_export import export_training_data
+
+        stats = export_training_data(self.records, out_dir,
+                                     self.task_id or 'current')
+        if self.log:
+            self.log.info(f'已导出训练数据：{stats["exported"]} 条 -> {stats["root"]}')
+            if stats['no_box'] or stats['no_line']:
+                self.log.warn(f'未能导出：缺文本框 {stats["no_box"]} 条，'
+                              f'未定位到行 {stats["no_line"]} 条')
+        return stats
 
     def summary(self) -> TaskSummary:
         return TaskSummary.from_records(self.records)

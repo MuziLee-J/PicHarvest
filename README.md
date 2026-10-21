@@ -94,6 +94,11 @@ python main.py
 实时进度、成功/失败/跳过计数、当前处理项、日志；
 支持 **暂停 / 继续 / 取消**（取消后已复制的文件保留）。
 
+> **🛑 强制停止**：识别过程中随时可以点。它会把后台 OCR 子进程直接
+> `kill` 掉——实测 **0.3 秒**内生效，不用等当前这张跑完。
+> 已识别完的文件结果保留，正在处理的那一张会丢弃。
+> 单张识别也支持超时自动终止（默认 60 秒）。
+
 结束后：生成 CSV / JSON / Excel 报告，可 **打开输出目录 / 导出报告 / 撤销本次任务**。
 
 ---
@@ -143,6 +148,37 @@ CASE002_张三.jpg      ← 不冲突，一眼看得出出处
 文件名会经过完整清洗：非法字符 `\ / : * ? " < > |` 替换、首尾点与空格去除、
 控制字符清理、Windows 保留设备名（CON/NUL/COM1…）规避、超长截断、
 `\\?\` 长路径支持。
+
+---
+
+## 五点五、OCR 识别效果不好怎么办
+
+**先诊断，再决定要不要训练**：
+
+```bat
+python tools/diagnose_ocr.py --root "D:\示例数据\20250101" --limit 5
+```
+
+它会对同一张图跑四种预处理强度，打印每行文字的置信度，
+并告诉你问题到底出在**图像质量**、**命名字段**还是**模型能力**。
+
+提升路径按性价比排序（前两项都不需要训练）：
+
+| 手段 | 成本 | 说明 |
+|---|---|---|
+| **换更强的预训练模型** | 几分钟 | 设置里填 PP-OCRv4/v5 **server** 模型路径，不用标注、不用 GPU |
+| **调预处理强度** | 几秒 | 用诊断工具选置信度最高的那档 |
+| **纠正记忆** | 自动积累 | 你每次手工改名都会被记住，相同文本再次出现时直接沿用 |
+| **微调识别模型** | 1~2 天 + GPU | 需要 ≥500 条**单行截图**标注，见 [`docs/OCR_训练指南.md`](docs/OCR_训练指南.md) |
+
+**关于"用已有数据训练"**：可以，但要注意数据形态——识别模型吃的是
+**单行文字截图 + 正确文字**，不是整张照片。本程序提供
+**工具 → 导出 OCR 训练数据**，会裁出姓名所在的行并生成 PaddleOCR
+可直接使用的 `train.txt`，同时附一份 `review.csv` 供你核对标签。
+
+> ⚠️ 程序刻意不做"相似文本"的模糊匹配：同一套表单换个姓名时，
+> 两段 OCR 文本相似度往往超过 99%，模糊匹配会把上一个人的名字
+> 安到这个人头上。只有**完全相同的文本**才会复用修正。
 
 ---
 
@@ -225,9 +261,11 @@ dist\PicHarvest\PicHarvest.exe --selftest
 ## 九、测试
 
 ```bat
-python -m unittest discover -s tests -t . -v    # 122 个测试，全部零依赖可跑
+python -m unittest discover -s tests -t . -v    # 138 个测试
 python tools/smoke_test.py                      # 端到端冒烟（含真实 OCR）
 python tools/ui_test.py                         # 无头 GUI 全流程自检
+python tools/test_force_stop.py                 # 验证强制停止/超时真的生效
+python tools/diagnose_ocr.py --root ... --limit 5   # OCR 效果诊断
 python tools/make_test_data.py                  # 只生成测试数据
 ```
 
@@ -253,19 +291,27 @@ python tools/make_test_data.py                  # 只生成测试数据
 ## 十、项目结构
 
 ```
-main.py                     入口（高DPI / 全局异常兜底）
+main.py                     入口（高DPI / 全局异常兜底 / --ocr-worker / --selftest）
 models.py                   全部数据结构（ImageRecord / TaskConfig / 状态常量）
 build_exe.py                一键打包
 packaging/PicHarvest.spec   PyInstaller 配置
 ui/       PySide6 界面：主窗口 / 设置 / 扫描 / OCR命名 / 执行结果 / 线程 / 组件
-core/     纯标准库：path_matcher 扫描 filename_manager 命名 extractor 复制 task_manager 编排
-ocr/      engine 抽象与自动降级 / paddle / rapid / preprocess 预处理 / parser 解析 / suggester AI判断
-database/ SQLite 任务历史
-reports/  CSV / JSON / Excel 报告
+core/     纯标准库：path_matcher 扫描 filename_manager 命名 extractor 复制
+         task_manager 编排 correction_memory 纠正记忆
+ocr/      engine 抽象 / paddle / rapid / process_engine 子进程代理
+         worker_process 子进程入口 / preprocess / parser / suggester
+database/ SQLite 任务历史 + 纠正记忆
+reports/  CSV / JSON / Excel 报告 + training_export 训练数据导出
 utils/    validators 校验 / file_utils 文件 / logger 日志 / config 配置
-tools/    测试数据生成、冒烟测试、界面自检
-tests/    unittest 测试套件
+docs/     OCR_训练指南.md
+tools/    诊断、强制停止验证、测试数据生成、冒烟测试、界面自检
+tests/    unittest 测试套件（138 个）
 ```
+
+**OCR 为什么要跑在子进程里**：PaddleOCR / RapidOCR 的推理是阻塞的
+C++ 调用，Python 线程无法中断它。放进子进程后，父进程 `kill()` 就能
+立即终止——这是"强制停止"能真正生效的唯一办法，也顺带让单张超时
+成为可能。
 
 **分层铁律**：`core/` 与 `ocr/parser|suggester` 不导入 PySide6、不导入 numpy，
 因此可以在任何环境跑测试；换 OCR 引擎不需要动扫描与复制模块

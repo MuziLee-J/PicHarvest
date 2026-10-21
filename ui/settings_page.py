@@ -12,8 +12,8 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QFileDialog,
                                QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
                                QLabel, QLineEdit, QPushButton, QRadioButton,
-                               QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout,
-                               QWidget)
+                               QScrollArea, QSizePolicy, QSpinBox, QStackedWidget,
+                               QVBoxLayout, QWidget)
 
 from core.path_matcher import (build_template, describe_template_effect,
                                normalize_template, validate_template)
@@ -374,7 +374,65 @@ class SettingsPage(QWidget):
         self.recheck_button = QPushButton('检测 OCR 环境')
         self.recheck_button.clicked.connect(self.refresh_engine_status)
         layout.addWidget(self.recheck_button, 2, 0)
+
+        # --- 运行方式与超时 ---
+        run_row = QHBoxLayout()
+        self.use_process_check = QCheckBox('子进程隔离（支持"强制停止"与单张超时）')
+        self.use_process_check.setChecked(True)
+        self.use_process_check.setToolTip(
+            '勾选后 OCR 在独立进程中运行，点"强制停止"能立即结束识别。\n'
+            '取消勾选则在本进程内识别，无法中途打断。')
+        run_row.addWidget(self.use_process_check)
+
+        run_row.addWidget(QLabel('单张超时：'))
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(5, 600)
+        self.timeout_spin.setValue(60)
+        self.timeout_spin.setSuffix(' 秒')
+        self.timeout_spin.setMaximumWidth(100)
+        self.timeout_spin.setToolTip('超过该时间会自动终止该张识别，继续下一张')
+        run_row.addWidget(self.timeout_spin)
+        run_row.addStretch(1)
+        layout.addLayout(run_row, 3, 0, 1, 4)
+
+        # --- 自定义模型（提升精度，不需要训练）---
+        model_row = QHBoxLayout()
+        self.rec_model_edit = QLineEdit()
+        self.rec_model_edit.setPlaceholderText('留空使用内置模型')
+        self.rec_model_edit.setToolTip(
+            '识别模型路径。换成 PP-OCRv4/v5 的 server 模型通常能明显提升精度。')
+        model_row.addWidget(QLabel('识别模型：'))
+        model_row.addWidget(self.rec_model_edit, 1)
+        browse_rec = QPushButton('浏览…')
+        browse_rec.clicked.connect(lambda: self._pick_model(self.rec_model_edit))
+        model_row.addWidget(browse_rec)
+        layout.addLayout(model_row, 4, 0, 1, 4)
+
+        det_row = QHBoxLayout()
+        self.det_model_edit = QLineEdit()
+        self.det_model_edit.setPlaceholderText('留空使用内置模型')
+        self.det_model_edit.setToolTip('文本检测模型路径（通常不需要改）')
+        det_row.addWidget(QLabel('检测模型：'))
+        det_row.addWidget(self.det_model_edit, 1)
+        browse_det = QPushButton('浏览…')
+        browse_det.clicked.connect(lambda: self._pick_model(self.det_model_edit))
+        det_row.addWidget(browse_det)
+        layout.addLayout(det_row, 5, 0, 1, 4)
+
+        layout.addWidget(make_hint(
+            '换更强的预训练模型比从头训练划算：不用标注、不用 GPU，'
+            '直接填模型目录即可。'), 6, 0, 1, 4)
         return group
+
+    def _pick_model(self, edit: QLineEdit) -> None:
+        """选择模型文件（.onnx）或目录（PaddleOCR 推理模型目录）。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, '选择模型文件（也可直接在输入框里填目录）', '',
+            '模型文件 (*.onnx *.pdmodel);;所有文件 (*.*)')
+        if not path:
+            path = QFileDialog.getExistingDirectory(self, '选择模型目录')
+        if path:
+            edit.setText(os.path.normpath(path))
 
     # ================================================================ 交互
 
@@ -632,6 +690,10 @@ class SettingsPage(QWidget):
         self.engine_combo.setCurrentIndex(max(0, index))
         index = self.preprocess_combo.findData(ocr_conf.preprocess)
         self.preprocess_combo.setCurrentIndex(max(0, index))
+        self.use_process_check.setChecked(bool(ocr_conf.use_process))
+        self.timeout_spin.setValue(int(ocr_conf.timeout_sec or 60))
+        self.rec_model_edit.setText(ocr_conf.rec_model_path or '')
+        self.det_model_edit.setText(ocr_conf.det_model_path or '')
 
         self._refresh_rule_preview()
 
@@ -693,6 +755,10 @@ class SettingsPage(QWidget):
             ocr=OcrConfig(
                 engine=self.engine_combo.currentData() or 'auto',
                 preprocess=self.preprocess_combo.currentData() or 'standard',
+                timeout_sec=int(self.timeout_spin.value()),
+                use_process=self.use_process_check.isChecked(),
+                rec_model_path=self.rec_model_edit.text().strip(),
+                det_model_path=self.det_model_edit.text().strip(),
             ),
             output=OutputConfig(
                 output_dir=output_dir,

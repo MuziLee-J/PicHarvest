@@ -43,12 +43,14 @@ class Status:
 
 class ExtractMethod:
     """名字提取方式。"""
+    LEARNED = 'learned'    # 历史修正记忆（同一个人工修正过的 OCR 文本）
     FIELD = 'field'        # 用户指定字段
     AI = 'ai'              # 本地 AI 判断
     MANUAL = 'manual'      # 人工输入
     FALLBACK = 'fallback'  # 兜底（来源名 / 原文件名）
 
     LABELS = {
+        LEARNED: '历史修正',
         FIELD: '指定字段',
         AI: 'AI判断',
         MANUAL: '人工修改',
@@ -125,8 +127,14 @@ class OcrConfig:
     lang: str = 'ch'
     preprocess: str = 'standard'     # none | light | standard | strong
     min_confidence: float = 0.45     # 低于该值视为不可靠
-    timeout_sec: int = 60            # 单张图 OCR 超时
+    timeout_sec: int = 60            # 单张图 OCR 超时（子进程模式下可真正强制终止）
     max_side: int = 2200             # 预处理时最长边上限（控制内存）
+    # --- 强制停止相关 ---
+    use_process: bool = True         # 在独立子进程中运行 OCR：可被真正杀死
+    startup_timeout: int = 90        # 子进程模型加载的超时（首次加载可能较慢）
+    # --- 可选的更强模型（不训练也能提升）---
+    rec_model_path: str = ''         # 自定义识别模型（如 PP-OCRv4 server）
+    det_model_path: str = ''         # 自定义检测模型
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -214,6 +222,9 @@ class ImageRecord:
     # --- OCR 阶段（只读）
     ocr_text: str = ''
     ocr_lines: list = field(default_factory=list)
+    ocr_boxes: list = field(default_factory=list)   # 与 ocr_lines 对齐的 [x1,y1,x2,y2]
+    ocr_image_size: tuple = (0, 0)                  # 识别时所用图片尺寸（预处理后）
+    ocr_predicted_name: str = ''                    # 系统最初建议（人工修改前的值）
     ocr_engine: str = ''
     ocr_confidence: float = 0.0
     ocr_error: Optional[str] = None

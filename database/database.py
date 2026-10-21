@@ -73,6 +73,21 @@ CREATE TABLE IF NOT EXISTS task_files (
     FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS corrections (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT NOT NULL,
+    fingerprint     TEXT NOT NULL,
+    ocr_text        TEXT,
+    field           TEXT DEFAULT '',
+    suggested_name  TEXT,
+    corrected_name  TEXT,
+    source_folder   TEXT,
+    use_count       INTEGER DEFAULT 1,
+    last_used_at    TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_key
+    ON corrections(fingerprint, field);
 CREATE INDEX IF NOT EXISTS idx_files_task ON task_files(task_id);
 CREATE INDEX IF NOT EXISTS idx_files_status ON task_files(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC);
@@ -218,6 +233,74 @@ class Database:
                 'SELECT * FROM task_files WHERE task_id=? AND created=1 AND status=?',
                 (task_id, 'success')).fetchall()
         return [dict(row) for row in rows]
+
+    # -------------------------------------------------- 纠正记忆
+
+    def add_correction(self, ocr_text: str, field: str, suggested: str,
+                       corrected: str, source_folder: str = '',
+                       fingerprint: str = '') -> None:
+        """记录一次人工修正（同一份文本重复修正时累计次数）。"""
+        if not fingerprint:
+            from core.correction_memory import text_fingerprint
+            fingerprint = text_fingerprint(ocr_text)
+        now = now_text()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO corrections
+                       (created_at, fingerprint, ocr_text, field,
+                        suggested_name, corrected_name, source_folder,
+                        use_count, last_used_at)
+                   VALUES (?,?,?,?,?,?,?,1,?)
+                   ON CONFLICT(fingerprint, field) DO UPDATE SET
+                       corrected_name = excluded.corrected_name,
+                       suggested_name = excluded.suggested_name,
+                       source_folder  = excluded.source_folder,
+                       use_count      = corrections.use_count + 1,
+                       last_used_at   = excluded.last_used_at""",
+                (now, fingerprint, ocr_text, field or '', suggested or '',
+                 corrected or '', source_folder or '', now))
+            self._conn.commit()
+
+    def get_correction(self, fingerprint: str, field: str = '') -> dict | None:
+        """按指纹查修正；先精确匹配字段，再回退到任意字段。"""
+        with self._lock:
+            row = self._conn.execute(
+                'SELECT * FROM corrections WHERE fingerprint=? AND field=?',
+                (fingerprint, field or '')).fetchone()
+            if row is None:
+                row = self._conn.execute(
+                    'SELECT * FROM corrections WHERE fingerprint=?'
+                    ' ORDER BY use_count DESC, last_used_at DESC LIMIT 1',
+                    (fingerprint,)).fetchone()
+        return dict(row) if row else None
+
+    def list_corrections(self, field: str = '', limit: int = 500) -> list[dict]:
+        sql = 'SELECT * FROM corrections'
+        params: list[Any] = []
+        if field:
+            sql += ' WHERE field=?'
+            params.append(field)
+        sql += ' ORDER BY use_count DESC, last_used_at DESC LIMIT ?'
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def correction_stats(self) -> dict:
+        with self._lock:
+            total = self._conn.execute(
+                'SELECT COUNT(*) FROM corrections').fetchone()[0]
+            rows = self._conn.execute(
+                'SELECT field, COUNT(*) AS n FROM corrections GROUP BY field'
+            ).fetchall()
+        return {'count': int(total),
+                'fields': {(row['field'] or '(未指定)'): int(row['n'])
+                           for row in rows}}
+
+    def delete_correction(self, correction_id: int) -> None:
+        with self._lock:
+            self._conn.execute('DELETE FROM corrections WHERE id=?', (correction_id,))
+            self._conn.commit()
 
     def stats(self) -> dict:
         """总体统计。"""

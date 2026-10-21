@@ -22,6 +22,7 @@ class ResultPage(QWidget):
 
     pause_requested = Signal()
     cancel_requested = Signal()
+    force_stop_requested = Signal()
     undo_requested = Signal()
     export_requested = Signal()
     new_task_requested = Signal()
@@ -102,6 +103,14 @@ class ResultPage(QWidget):
         self.cancel_button = QPushButton('取消任务')
         self.cancel_button.clicked.connect(self._on_cancel_clicked)
         controls.addWidget(self.cancel_button)
+
+        self.force_stop_button = QPushButton('强制停止')
+        self.force_stop_button.setObjectName('danger')
+        self.force_stop_button.setToolTip(
+            '立即终止正在进行的 OCR（后台子进程会被直接结束）。\n'
+            '已完成的文件不受影响，当前这一张的结果可能丢失。')
+        self.force_stop_button.clicked.connect(self.force_stop_requested.emit)
+        controls.addWidget(self.force_stop_button)
         controls.addStretch(1)
         layout.addLayout(controls)
 
@@ -154,6 +163,7 @@ class ResultPage(QWidget):
         self.pause_button.setText('暂停')
         self.pause_button.setEnabled(True)
         self.cancel_button.setEnabled(True)
+        self.force_stop_button.setEnabled(True)
         self.done_group.setVisible(False)
         for label in self.counter_labels.values():
             label.setText('0')
@@ -203,6 +213,7 @@ class ResultPage(QWidget):
         self.busy_label.setText('处理结束。')
         self.pause_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
+        self.force_stop_button.setEnabled(False)
         self.progress.setValue(self.progress.maximum())
 
         lines = [

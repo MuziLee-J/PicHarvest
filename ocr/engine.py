@@ -31,9 +31,14 @@ class OcrResult:
     text: str = ''                 # 整段文本（按行拼接）
     lines: list = field(default_factory=list)      # list[str]
     scores: list = field(default_factory=list)     # list[float]
+    boxes: list = field(default_factory=list)      # list[[x1,y1,x2,y2]] 与 lines 对齐
     engine: str = ''
     elapsed: float = 0.0
     error: str = ''
+    canceled: bool = False         # 是否因用户取消/强制停止而中断
+    #: 识别时所用图片的尺寸 (宽, 高)。预处理会缩放，导出训练数据时
+    #: 需要用它把 boxes 映射回原图坐标。
+    image_size: tuple = (0, 0)
 
     @property
     def ok(self) -> bool:
@@ -65,6 +70,29 @@ class OcrEngine(ABC):
     @abstractmethod
     def recognize(self, image) -> OcrResult:
         """识别单张图片。image 可以是路径(str) 或 numpy 数组。"""
+
+    def recognize_path(self, path: str, preset: str = 'standard',
+                       max_side: int = 2200, timeout: float | None = None,
+                       cancel_event=None) -> OcrResult:
+        """按路径识别（默认实现：本进程预处理 + 识别）。
+
+        子进程引擎会覆盖此方法，以便把图片交给可被杀死的子进程处理。
+        """
+        if cancel_event is not None and cancel_event.is_set():
+            return OcrResult(engine=self.name, error='已取消', canceled=True)
+        try:
+            from ocr.preprocess import preprocess
+            image = preprocess(path, preset, max_side)
+        except Exception as exc:
+            return OcrResult(engine=self.name, error=f'图片读取失败：{exc}')
+
+        result = self.recognize(image)
+        try:
+            height, width = image.shape[:2]
+            result.image_size = (int(width), int(height))
+        except Exception:
+            pass
+        return result
 
     def release(self) -> None:
         """释放资源。"""
@@ -105,14 +133,16 @@ _cache: dict[str, OcrEngine] = {}
 _lock = threading.RLock()
 
 
-def _create_engine(key: str) -> OcrEngine:
+def _create_engine(key: str, rec_model_path: str = '', det_model_path: str = '') -> OcrEngine:
     """按名称创建引擎实例（延迟 import，避免无依赖时崩溃）。"""
     if key == 'paddle':
         from ocr.paddle_engine import PaddleOcrEngine
-        return PaddleOcrEngine()
+        return PaddleOcrEngine(rec_model_path=rec_model_path,
+                               det_model_path=det_model_path)
     if key == 'rapid':
         from ocr.rapid_engine import RapidOcrEngine
-        return RapidOcrEngine()
+        return RapidOcrEngine(rec_model_path=rec_model_path,
+                              det_model_path=det_model_path)
     return NullEngine()
 
 
@@ -136,10 +166,12 @@ def available_engine_keys() -> list[str]:
     return [key for key, info in engine_status().items() if info.get('available')]
 
 
-def get_engine(prefer: str = 'auto', force_reload: bool = False) -> OcrEngine:
+def get_engine(prefer: str = 'auto', force_reload: bool = False,
+               rec_model_path: str = '', det_model_path: str = '') -> OcrEngine:
     """获取 OCR 引擎实例（进程内单例）。
 
     prefer: auto | paddle | rapid | none
+    rec_model_path / det_model_path: 可选的自定义模型路径（换更强模型用）
     """
     global _cache
     prefer = (prefer or 'auto').lower()
@@ -148,15 +180,21 @@ def get_engine(prefer: str = 'auto', force_reload: bool = False) -> OcrEngine:
         if prefer == 'none':
             return NullEngine()
 
+        # 带自定义模型时不复用缓存（模型可能被换过）
+        cache_key = prefer
+        if rec_model_path or det_model_path:
+            cache_key = f'{prefer}:{rec_model_path}:{det_model_path}'
+            force_reload = True
+
         if prefer != 'auto':
-            if not force_reload and prefer in _cache:
-                return _cache[prefer]
-            engine = _create_engine(prefer)
+            if not force_reload and cache_key in _cache:
+                return _cache[cache_key]
+            engine = _create_engine(prefer, rec_model_path, det_model_path)
             if not type(engine).is_available():
                 logger.warning('指定的引擎 %s 不可用，回退到自动选择', prefer)
                 engine = None
             if engine is not None:
-                _cache[prefer] = engine
+                _cache[cache_key] = engine
                 return engine
 
         # 自动：按优先级取第一个可用的
@@ -164,7 +202,7 @@ def get_engine(prefer: str = 'auto', force_reload: bool = False) -> OcrEngine:
             if key in _cache and not force_reload:
                 return _cache[key]
             try:
-                engine = _create_engine(key)
+                engine = _create_engine(key, rec_model_path, det_model_path)
             except Exception as exc:
                 logger.warning('引擎 %s 初始化失败：%s', key, exc)
                 continue
@@ -190,49 +228,24 @@ def reset_engines() -> None:
 
 # ==================================================================== 归一化工具
 
-def normalize_ocr_payload(payload, confidence_default: float = 0.0) -> tuple[list[str], list[float]]:
-    """把各种 OCR 引擎的输出归一化成 (文本行, 置信度)。
+def normalize_ocr_payload(payload, confidence_default: float = 0.0
+                          ) -> tuple[list[str], list[float], list[list[float]]]:
+    """把各种 OCR 引擎的输出归一化成 (文本行, 置信度, 文本框)。
 
     兼容：
     - PaddleOCR 2.x:  [[[box, (text, score)], ...]]
-    - PaddleOCR 3.x:  [{'rec_texts': [...], 'rec_scores': [...]}]
+    - PaddleOCR 3.x:  [{'rec_texts': [...], 'rec_scores': [...], 'rec_polys': [...]}]
     - RapidOCR:       [[box, text, score], ...]
     - 纯文本列表:     [['第一行', 0.9], ...]
+
+    文本框统一为 [x1, y1, x2, y2]；取不到时为 None（与 lines 等长）。
+    这些框用于"导出训练数据"时裁剪单行文字。
     """
     texts: list[str] = []
     scores: list[float] = []
+    boxes: list = []
 
-    def walk(node, depth: int = 0) -> None:
-        if node is None or depth > 8:
-            return
-        if isinstance(node, dict):
-            rec_texts = node.get('rec_texts') or node.get('texts')
-            rec_scores = node.get('rec_scores') or node.get('scores')
-            if isinstance(rec_texts, (list, tuple)):
-                for i, text in enumerate(rec_texts):
-                    score = confidence_default
-                    if isinstance(rec_scores, (list, tuple)) and i < len(rec_scores):
-                        try:
-                            score = float(rec_scores[i])
-                        except (TypeError, ValueError):
-                            score = confidence_default
-                    _push(text, score)
-                return
-            for value in node.values():
-                walk(value, depth + 1)
-            return
-        if isinstance(node, (list, tuple)):
-            # 形如 [box, text, score] 或 [box, (text, score)]
-            if len(node) in (2, 3) and _is_text_nodes(node):
-                _push(*_extract_text_score(node))
-                return
-            for item in node:
-                walk(item, depth + 1)
-            return
-        if isinstance(node, str):
-            _push(node, confidence_default)
-
-    def _push(text, score) -> None:
+    def push(text, score, box=None) -> None:
         text = (text or '').strip() if isinstance(text, str) else ''
         if not text:
             return
@@ -242,9 +255,77 @@ def normalize_ocr_payload(payload, confidence_default: float = 0.0) -> tuple[lis
             score = confidence_default
         texts.append(text)
         scores.append(score)
+        boxes.append(_normalize_box(box))
+
+    def walk(node, depth: int = 0) -> None:
+        if node is None or depth > 8:
+            return
+        if isinstance(node, dict):
+            rec_texts = node.get('rec_texts') or node.get('texts')
+            rec_scores = node.get('rec_scores') or node.get('scores')
+            rec_boxes = (node.get('rec_polys') or node.get('dt_polys')
+                         or node.get('boxes') or node.get('rec_boxes'))
+            if isinstance(rec_texts, (list, tuple)):
+                for i, text in enumerate(rec_texts):
+                    score = confidence_default
+                    if isinstance(rec_scores, (list, tuple)) and i < len(rec_scores):
+                        try:
+                            score = float(rec_scores[i])
+                        except (TypeError, ValueError):
+                            score = confidence_default
+                    box = None
+                    if isinstance(rec_boxes, (list, tuple)) and i < len(rec_boxes):
+                        box = rec_boxes[i]
+                    push(text, score, box)
+                return
+            for value in node.values():
+                walk(value, depth + 1)
+            return
+        if isinstance(node, (list, tuple)):
+            # 形如 [box, text, score] 或 [box, (text, score)]
+            if len(node) in (2, 3) and _is_text_nodes(node):
+                text, score = _extract_text_score(node)
+                # 第一个元素是文本框；纯文本列表（[text, score]）时为 str
+                candidate = node[0]
+                box = candidate if isinstance(candidate, (list, tuple)) else None
+                push(text, score, box)
+                return
+            for item in node:
+                walk(item, depth + 1)
+            return
+        if isinstance(node, str):
+            push(node, confidence_default)
 
     walk(payload)
-    return texts, scores
+    # 保证 boxes 与 texts 等长
+    while len(boxes) < len(texts):
+        boxes.append(None)
+    return texts, scores, boxes[:len(texts)]
+
+
+def _normalize_box(box) -> list[float] | None:
+    """把各种框格式统一成 [x1, y1, x2, y2]。"""
+    if box is None:
+        return None
+    try:
+        # 四点多边形：[[x,y], [x,y], [x,y], [x,y]]
+        if isinstance(box, (list, tuple)) and len(box) >= 2 and \
+                isinstance(box[0], (list, tuple, tuple)):
+            xs = []
+            ys = []
+            for point in box:
+                if isinstance(point, (list, tuple)) and len(point) >= 2:
+                    xs.append(float(point[0]))
+                    ys.append(float(point[1]))
+            if xs and ys:
+                return [min(xs), min(ys), max(xs), max(ys)]
+        # 直接是 [x1, y1, x2, y2]
+        if isinstance(box, (list, tuple)) and len(box) >= 4 and \
+                all(isinstance(v, (int, float)) for v in box[:4]):
+            return [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
+    except (TypeError, ValueError):
+        return None
+    return None
 
 
 def _is_text_nodes(node) -> bool:

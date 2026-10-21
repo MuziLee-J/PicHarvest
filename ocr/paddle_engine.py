@@ -27,9 +27,12 @@ class PaddleOcrEngine(OcrEngine):
     name = 'paddle'
     display_name = 'PaddleOCR（本地）'
 
-    def __init__(self, lang: str = 'ch', use_gpu: bool = False):
+    def __init__(self, lang: str = 'ch', use_gpu: bool = False,
+                 rec_model_path: str = '', det_model_path: str = ''):
         self.lang = lang or 'ch'
         self.use_gpu = use_gpu
+        self.rec_model_path = rec_model_path or ''
+        self.det_model_path = det_model_path or ''
         self._ocr = None
         self._lock = threading.RLock()
         self._warmed = False
@@ -51,11 +54,17 @@ class PaddleOcrEngine(OcrEngine):
                 return
             from paddleocr import PaddleOCR
 
+            custom = {}
+            if self.rec_model_path:
+                custom['rec_model_dir'] = self.rec_model_path
+            if self.det_model_path:
+                custom['det_model_dir'] = self.det_model_path
+
             attempts = [
-                dict(lang=self.lang, use_angle_cls=True, show_log=False),
-                dict(lang=self.lang, use_angle_cls=True),
-                dict(lang=self.lang),
-                dict(),
+                dict(lang=self.lang, use_angle_cls=True, show_log=False, **custom),
+                dict(lang=self.lang, use_angle_cls=True, **custom),
+                dict(lang=self.lang, **custom),
+                dict(**custom) if custom else dict(),
             ]
             last_error = None
             for kwargs in attempts:
@@ -117,15 +126,15 @@ class PaddleOcrEngine(OcrEngine):
                 return OcrResult(engine=self.name, error=f'OCR 识别失败：{error}',
                                  elapsed=time.time() - started)
 
-            texts, scores = normalize_ocr_payload(raw)
+            texts, scores, boxes = normalize_ocr_payload(raw)
             text = '\n'.join(texts)
             if not text.strip():
                 # 空结果通常意味着图片没有文字或质量太差
                 return OcrResult(engine=self.name, text='', lines=[], scores=[],
-                                 elapsed=time.time() - started,
+                                 boxes=[], elapsed=time.time() - started,
                                  error='未识别到任何文字')
             return OcrResult(engine=self.name, text=text, lines=texts, scores=scores,
-                             elapsed=time.time() - started)
+                             boxes=boxes, elapsed=time.time() - started)
 
     # --------------------------------------------------
 
