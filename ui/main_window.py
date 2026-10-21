@@ -455,15 +455,20 @@ class MainWindow(QMainWindow):
             self._append_log('当前没有正在运行的任务，无需停止')
             return
 
+        # OCR 阶段才能真正"杀掉"后台进程；复制/扫描阶段只能让循环尽快退出
+        from ui.workers import OcrWorker, SingleOcrWorker
+        is_ocr_phase = isinstance(self.worker, (OcrWorker, SingleOcrWorker))
+
         stopped = False
-        if self.manager is not None:
+        if is_ocr_phase and self.manager is not None:
             try:
                 stopped = self.manager.force_stop()
             except Exception as exc:
                 self._append_log(f'强制停止时出错：{exc}')
 
         self.worker.cancel()          # 置位取消事件，循环下一次检查即退出
-        self.ocr_page.set_stopping()
+        if is_ocr_phase:
+            self.ocr_page.set_stopping()
 
         if stopped:
             self._update_status('已强制停止：后台 OCR 进程已终止')

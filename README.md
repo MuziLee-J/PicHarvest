@@ -261,7 +261,7 @@ dist\PicHarvest\PicHarvest.exe --selftest
 ## 九、测试
 
 ```bat
-python -m unittest discover -s tests -t . -v    # 138 个测试
+python -m unittest discover -s tests -t . -v    # 142 个测试
 python tools/smoke_test.py                      # 端到端冒烟（含真实 OCR）
 python tools/ui_test.py                         # 无头 GUI 全流程自检
 python tools/test_force_stop.py                 # 验证强制停止/超时真的生效
