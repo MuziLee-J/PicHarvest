@@ -86,8 +86,6 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self.status = self.statusBar()
-        self.status_label = QLabel('')
-        self.status.addPermanentWidget(self.status_label)
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu('文件(&F)')
@@ -168,8 +166,8 @@ class MainWindow(QMainWindow):
         self.step_bar.set_step(index)
 
     def _update_status(self, text: str) -> None:
+        # 只在状态栏显示一次，避免同一句话左右各出现一遍。
         self.status.showMessage(text)
-        self.status_label.setText(text)
 
     def _append_log(self, text: str) -> None:
         self.result_page.append_log(text)

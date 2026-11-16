@@ -81,14 +81,14 @@ SCAN_COLUMNS = [
 
 #: OCR 页列
 OCR_COLUMNS = [
-    Column('check', '', 34, 'check'),
-    Column('index', '序号', 60),
-    Column('source_folder', '来源文件夹', 120),
-    Column('ocr_text', 'OCR 结果', 280),
-    Column('extracted_name', '识别名称', 130),
-    Column('method', '方式', 80),
-    Column('final_filename', '最终文件名', 260),
-    Column('status', '状态', 100, 'status'),
+    Column('check', '', 30, 'check'),
+    Column('index', '序号', 44),
+    Column('source_folder', '来源文件夹', 112),
+    Column('ocr_text', 'OCR 结果', 200),
+    Column('extracted_name', '识别名称', 108),
+    Column('method', '方式', 76),
+    Column('final_filename', '最终文件名', 150),
+    Column('status', '状态', 88, 'status'),
 ]
 
 #: 结果页列
@@ -454,6 +454,37 @@ class StepBar(QWidget):
 
 # ==================================================================== 预览
 
+class ElidedLabel(QLabel):
+    """单行标签：宽度不够时中间省略，完整文本放在 tooltip。"""
+
+    def __init__(self, text: str = '', parent=None):
+        self._full = text or ''
+        super().__init__(self._full, parent)
+        self.setWordWrap(False)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.setToolTip(self._full)
+
+    def setText(self, text: str) -> None:      # noqa: N802 - Qt 命名
+        self._full = text or ''
+        self.setToolTip(self._full)
+        super().setText(self._elide(self._full))
+
+    def fullText(self) -> str:
+        return self._full
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        super().setText(self._elide(self._full))
+
+    def _elide(self, text: str) -> str:
+        if not text:
+            return ''
+        width = max(40, self.width() - 2)
+        return self.fontMetrics().elidedText(
+            text, Qt.TextElideMode.ElideMiddle, width)
+
+
 class ImagePreview(QFrame):
     """图片预览面板。"""
 
@@ -463,16 +494,18 @@ class ImagePreview(QFrame):
         self._pixmap: QPixmap | None = None
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setContentsMargins(6, 6, 6, 4)
+        layout.setSpacing(4)
         self.title = QLabel(title)
         self.title.setObjectName('title')
         self.view = QLabel('未选择图片')
         self.view.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.view.setMinimumSize(280, 240)
+        self.view.setMinimumSize(280, 140)
         self.view.setStyleSheet('background:#fafbfc; border:1px solid #e3e7eb; color:#9aa3ad;')
         self.info = QLabel('')
         self.info.setObjectName('hint')
-        self.info.setWordWrap(True)
+        self.info.setWordWrap(False)
+        self._info_text = ''
 
         layout.addWidget(self.title)
         layout.addWidget(self.view, 1)
@@ -487,17 +520,32 @@ class ImagePreview(QFrame):
         else:
             self._pixmap = pixmap
             self._rescale()
-        self.info.setText(info or (path if path else ''))
+        self._info_text = info or (path if path else '')
+        self.info.setToolTip(self._info_text)
+        self._apply_info()
 
     def clear(self) -> None:
         self._pixmap = None
         self.view.setPixmap(QPixmap())
         self.view.setText('未选择图片')
+        self._info_text = ''
+        self.info.setToolTip('')
         self.info.setText('')
+
+    def _apply_info(self) -> None:
+        """路径可能很长：单行省略显示，完整路径放 tooltip，避免撑高面板。"""
+        text = self._info_text
+        if not text:
+            self.info.setText('')
+            return
+        width = max(60, self.info.width() - 4)
+        self.info.setText(self.info.fontMetrics().elidedText(
+            text, Qt.TextElideMode.ElideMiddle, width))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._rescale()
+        self._apply_info()
 
     def _rescale(self) -> None:
         if self._pixmap is None:

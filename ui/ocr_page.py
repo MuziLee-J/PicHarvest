@@ -10,16 +10,17 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QGroupBox,
-                               QHBoxLayout,
-                               QHeaderView, QLabel, QLineEdit, QMessageBox,
-                               QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
-                               QTableView, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame,
+                               QGridLayout, QGroupBox, QHBoxLayout,
+                               QLabel, QLineEdit, QMessageBox,
+                               QPlainTextEdit, QProgressBar, QPushButton,
+                               QScrollArea, QSplitter, QTableView,
+                               QVBoxLayout, QWidget)
 
 from models import ExtractMethod, ImageRecord, Status
-from ui.widgets import (ImagePreview, OCR_COLUMNS, RecordFilterProxy,
-                        RecordTableModel, configure_table_view, make_hint,
-                        selected_record)
+from ui.widgets import (ElidedLabel, ImagePreview, OCR_COLUMNS,
+                        RecordFilterProxy, RecordTableModel,
+                        configure_table_view, make_hint, selected_record)
 from utils import file_utils
 
 
@@ -119,14 +120,18 @@ class OcrPage(QWidget):
         self.proxy = RecordFilterProxy(self.model)
         configure_table_view(self.table, self.model, self.proxy.proxy, row_height=28)
         self.table.selectionModel().currentRowChanged.connect(self._on_row_changed)
-        self.table.horizontalHeader().setSectionResizeMode(
-            3, QHeaderView.ResizeMode.Stretch)
+        # 列宽固定（见 widgets.OCR_COLUMNS），窗口不够宽时用横向滚动条，
+        # 不再让中间列被 Stretch 压成一条窄缝。
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setMinimumSectionSize(48)
         splitter.addWidget(self.table)
 
-        splitter.addWidget(self._build_detail())
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([840, 460])
+        detail = self._build_detail()
+        detail.setMinimumWidth(360)
+        splitter.addWidget(detail)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([880, 380])
         layout.addWidget(splitter, 1)
 
         # 输出目录：跑完 OCR 才发现选错位置时，在这里直接改，不用重来
@@ -169,38 +174,56 @@ class OcrPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.preview = ImagePreview(title='原图预览')
-        layout.addWidget(self.preview, 2)
+        layout.addWidget(self.preview, 1)
 
         group = QGroupBox('识别与命名')
-        form = QVBoxLayout(group)
+        form = QGridLayout(group)
+        form.setContentsMargins(12, 10, 12, 10)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(6)
+        form.setColumnMinimumWidth(0, 78)
+        form.setColumnStretch(1, 1)
 
-        form.addWidget(QLabel('OCR 结果：'))
+        form.addWidget(QLabel('OCR 结果：'), 0, 0, 1, 2)
         self.ocr_text_edit = QPlainTextEdit()
         self.ocr_text_edit.setReadOnly(True)
-        self.ocr_text_edit.setMaximumHeight(140)
+        self.ocr_text_edit.setMinimumHeight(56)
+        self.ocr_text_edit.setMaximumHeight(110)
         self.ocr_text_edit.setPlaceholderText('（未识别到文字）')
-        form.addWidget(self.ocr_text_edit)
+        form.addWidget(self.ocr_text_edit, 1, 0, 1, 2)
 
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel('识别名称：'))
+        name_label = QLabel('识别名称：')
+        name_label.setAlignment(Qt.AlignmentFlag.AlignRight
+                                | Qt.AlignmentFlag.AlignVCenter)
+        form.addWidget(name_label, 2, 0)
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText('留空表示无法识别')
         self.name_edit.editingFinished.connect(self._on_name_edited)
-        row1.addWidget(self.name_edit, 1)
-        form.addLayout(row1)
+        form.addWidget(self.name_edit, 2, 1)
 
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel('最终文件名：'))
+        filename_label = QLabel('最终文件名：')
+        filename_label.setAlignment(Qt.AlignmentFlag.AlignRight
+                                    | Qt.AlignmentFlag.AlignVCenter)
+        form.addWidget(filename_label, 3, 0)
         self.filename_edit = QLineEdit()
         self.filename_edit.setPlaceholderText('可直接修改（系统会自动清洗非法字符）')
         self.filename_edit.editingFinished.connect(self._on_filename_edited)
-        row2.addWidget(self.filename_edit, 1)
-        form.addLayout(row2)
+        form.addWidget(self.filename_edit, 3, 1)
 
         self.suggest_label = QLabel('')
         self.suggest_label.setObjectName('hint')
         self.suggest_label.setWordWrap(True)
-        form.addWidget(self.suggest_label)
+        form.addWidget(self.suggest_label, 4, 0, 1, 2)
+
+        dest_caption = QLabel('将复制到：')
+        dest_caption.setAlignment(Qt.AlignmentFlag.AlignRight
+                                  | Qt.AlignmentFlag.AlignVCenter)
+        form.addWidget(dest_caption, 5, 0)
+        # 目标路径往往很长，用单行省略标签：不会换行把面板撑高，
+        # 完整路径放在 tooltip 里，需要时悬停或选中复制即可。
+        self.dest_edit = ElidedLabel('')
+        self.dest_edit.setObjectName('hint')
+        form.addWidget(self.dest_edit, 5, 1)
 
         buttons = QHBoxLayout()
         self.accept_button = QPushButton('采用')
@@ -223,10 +246,20 @@ class OcrPage(QWidget):
         self.open_button.clicked.connect(self._on_open_image)
         buttons.addWidget(self.open_button)
         buttons.addStretch(1)
-        form.addLayout(buttons)
+        form.addLayout(buttons, 6, 0, 1, 2)
 
-        layout.addWidget(group, 3)
-        return panel
+        # 表单一类固定高度，多余空间交给上面的预览图，避免行距被拉开。
+        layout.addWidget(group, 0)
+
+        # 窗口很矮时（例如 1024x700）右侧内容放不下，用滚动区兜住，
+        # 否则布局会把控件压到互相重叠；高度够时滚动条自动隐藏。
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(panel)
+        return scroll
 
     # ================================================================ 数据
 
@@ -282,6 +315,13 @@ class OcrPage(QWidget):
         """重新载入记录（OCR 完成或批量操作后调用）。"""
         if self.manager is None:
             return
+        # 先算出最终文件名：这样"最终文件名"列和"将复制到"提示在进入本页时
+        # 就有内容，而不是等执行时才出现一片空白。
+        if self.manager.records and self.manager.config.output.output_dir:
+            try:
+                self.manager.rebuild_names(only_selected=True)
+            except Exception:          # 目录不可写等异常不应阻断列表展示
+                pass
         self.model.set_records(self.manager.records)
         self._sync_output_dir()
         self._update_counts()
@@ -343,10 +383,13 @@ class OcrPage(QWidget):
             ]
             if record.error:
                 lines.append(f'<span style="color:#c47f0a">提示：{record.error}</span>')
-            lines.append(f'将复制到：{self._dest_hint(record)}')
             if record.conflict_note:
                 lines.append(f'<span style="color:#c47f0a">{record.conflict_note}</span>')
             self.suggest_label.setText('<br>'.join(lines))
+
+            dest = self._dest_hint(record)
+            self.dest_edit.setText(dest)
+            self.dest_edit.setToolTip(dest)
         finally:
             self._loading = False
 
