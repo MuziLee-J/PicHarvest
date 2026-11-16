@@ -7,8 +7,11 @@
 
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QGroupBox, QHBoxLayout,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QGroupBox,
+                               QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMessageBox,
                                QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
                                QTableView, QVBoxLayout, QWidget)
@@ -28,6 +31,7 @@ class OcrPage(QWidget):
     reocr_requested = Signal(object)          # ImageRecord
     accept_all_requested = Signal()
     force_stop_requested = Signal()
+    output_dir_changed = Signal(str)      # OCR 后改输出目录（只需重算文件名）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -125,6 +129,21 @@ class OcrPage(QWidget):
         splitter.setSizes([840, 460])
         layout.addWidget(splitter, 1)
 
+        # 输出目录：跑完 OCR 才发现选错位置时，在这里直接改，不用重来
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel('输出目录：'))
+        self.output_dir_edit = QLineEdit()
+        self.output_dir_edit.setPlaceholderText('图片将复制到这里，可随时修改')
+        self.output_dir_edit.setToolTip(
+            '改这里只会重新计算目标文件名与路径，已完成的 OCR 结果全部保留，'
+            '不需要重新识别。')
+        self.output_dir_edit.editingFinished.connect(self._on_output_dir_edited)
+        dir_row.addWidget(self.output_dir_edit, 1)
+        self.output_dir_button = QPushButton('浏览…')
+        self.output_dir_button.clicked.connect(self._pick_output_dir)
+        dir_row.addWidget(self.output_dir_button)
+        layout.addLayout(dir_row)
+
         # 底部
         bottom = QHBoxLayout()
         back_button = QPushButton('← 返回扫描结果')
@@ -214,11 +233,57 @@ class OcrPage(QWidget):
     def set_manager(self, manager) -> None:
         self.manager = manager
 
+    # ---------------------------------------------------------------- 输出目录
+
+    def set_output_dir(self, path: str) -> None:
+        """外部（设置页 / 主窗口）改了目录后同步输入框，不触发信号。"""
+        if (self.output_dir_edit.text().strip() or '') == (path or '').strip():
+            return
+        self.output_dir_edit.blockSignals(True)
+        self.output_dir_edit.setText(path or '')
+        self.output_dir_edit.blockSignals(False)
+
+    def _sync_output_dir(self) -> None:
+        if self.manager is not None:
+            self.set_output_dir(self.manager.config.output.output_dir or '')
+
+    def _on_output_dir_edited(self) -> None:
+        if self.manager is None or self._loading:
+            return
+        path = self.output_dir_edit.text().strip()
+        if not path:
+            return
+        current = self.manager.config.output.output_dir or ''
+        try:
+            same = os.path.abspath(path) == os.path.abspath(current)
+        except Exception:
+            same = path == current
+        if not same:
+            self.output_dir_changed.emit(path)
+
+    def _pick_output_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, '选择输出目录（整理结果保存位置）',
+            self.output_dir_edit.text().strip() or '')
+        if path:
+            self.output_dir_edit.setText(os.path.normpath(path))
+            self._on_output_dir_edited()
+
+    def _dest_hint(self, record: ImageRecord) -> str:
+        """详情里展示"这张图最终会复制到哪里"。"""
+        if record.dest_path:
+            return record.dest_path
+        name = record.final_filename or record.suggested_filename
+        if not name or self.manager is None:
+            return '（执行时按最终文件名确定）'
+        return os.path.join(self.manager.config.output.output_dir or '', name)
+
     def refresh_records(self) -> None:
         """重新载入记录（OCR 完成或批量操作后调用）。"""
         if self.manager is None:
             return
         self.model.set_records(self.manager.records)
+        self._sync_output_dir()
         self._update_counts()
         current = self._current
         if current is not None and current in self.manager.records:
@@ -278,6 +343,7 @@ class OcrPage(QWidget):
             ]
             if record.error:
                 lines.append(f'<span style="color:#c47f0a">提示：{record.error}</span>')
+            lines.append(f'将复制到：{self._dest_hint(record)}')
             if record.conflict_note:
                 lines.append(f'<span style="color:#c47f0a">{record.conflict_note}</span>')
             self.suggest_label.setText('<br>'.join(lines))
@@ -412,7 +478,8 @@ class OcrPage(QWidget):
 
     def set_busy(self, busy: bool) -> None:
         for widget in (self.execute_button, self.accept_all_button,
-                       self.retry_failed_button, self.reocr_button):
+                       self.retry_failed_button, self.reocr_button,
+                       self.output_dir_edit, self.output_dir_button):
             widget.setEnabled(not busy)
         self.execute_button.setText('正在处理…' if busy else '确认并执行复制 →')
         if not busy:

@@ -11,9 +11,9 @@ import os
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout,
-                               QHeaderView, QLabel, QLineEdit, QMessageBox,
-                               QPushButton, QSplitter, QTableView, QVBoxLayout,
-                               QWidget)
+                               QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
+                               QPushButton, QSplitter, QTableView, QToolButton,
+                               QVBoxLayout, QWidget)
 
 from models import ImageRecord, ScanResult, Status
 from ui.widgets import (Column, ImagePreview, RecordFilterProxy, RecordTableModel,
@@ -81,11 +81,16 @@ class ScanPage(QWidget):
         self.thumb_check.toggled.connect(self._on_thumb_toggled)
         tools.addWidget(self.thumb_check)
 
-        for text, slot in (('全选', self.select_all), ('取消全选', self.select_none),
-                           ('反选', self.invert_selection)):
-            button = QPushButton(text)
-            button.clicked.connect(slot)
-            tools.addWidget(button)
+        # 全选/取消全选/反选是低频操作，收进一个下拉菜单，工具条留出更多宽度
+        self.bulk_button = QToolButton()
+        self.bulk_button.setText('批量选择')
+        self.bulk_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        bulk_menu = QMenu(self.bulk_button)
+        bulk_menu.addAction('全选', self.select_all)
+        bulk_menu.addAction('取消全选', self.select_none)
+        bulk_menu.addAction('反选', self.invert_selection)
+        self.bulk_button.setMenu(bulk_menu)
+        tools.addWidget(self.bulk_button)
         layout.addLayout(tools)
 
         # 表格 + 预览

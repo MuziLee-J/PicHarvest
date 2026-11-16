@@ -128,10 +128,13 @@ class OcrConfig:
     preprocess: str = 'standard'     # none | light | standard | strong
     min_confidence: float = 0.45     # 低于该值视为不可靠
     timeout_sec: int = 60            # 单张图 OCR 超时（子进程模式下可真正强制终止）
-    max_side: int = 2200             # 预处理时最长边上限（控制内存）
+    max_side: int = 1600             # OCR 输入最长边：越小越快；1200 快 / 1600 平衡 / 2200 清晰
     # --- 强制停止相关 ---
     use_process: bool = True         # 在独立子进程中运行 OCR：可被真正杀死
     startup_timeout: int = 90        # 子进程模型加载的超时（首次加载可能较慢）
+    # --- 速度相关 ---
+    workers: int = 1                 # 并发子进程数：1=串行（默认，单进程通常已占满 CPU）
+                                     # >1 只在单进程吃不饱 CPU 的机器上更快；0=自动
     # --- 可选的更强模型（不训练也能提升）---
     rec_model_path: str = ''         # 自定义识别模型（如 PP-OCRv4 server）
     det_model_path: str = ''         # 自定义检测模型

@@ -150,6 +150,7 @@ class MainWindow(QMainWindow):
         self.ocr_page.execute_requested.connect(self.on_execute)
         self.ocr_page.reocr_requested.connect(self.on_reocr)
         self.ocr_page.force_stop_requested.connect(self.on_force_stop)
+        self.ocr_page.output_dir_changed.connect(self.on_output_dir_changed)
 
         self.result_page.pause_requested.connect(self.on_pause)
         self.result_page.cancel_requested.connect(self.on_cancel)
@@ -273,8 +274,29 @@ class MainWindow(QMainWindow):
         self.ocr_page.set_progress(event.current, event.total,
                                    f'{event.current}/{event.total} '
                                    f'{os.path.basename(event.source or "")}')
-        if event.current % 5 == 0 or event.current == event.total:
-            self.ocr_page.update_record_by_index(event.current - 1)
+        # 并发识别时完成顺序是乱的：按事件携带的记录下标刷新，
+        # 而不是用"第几个完成"去推算行号，否则会刷错行。
+        index = (event.extra or {}).get('record_index')
+        if index is None:
+            index = event.current - 1
+        self.ocr_page.update_record_by_index(index)
+
+    def on_output_dir_changed(self, path: str) -> None:
+        """OCR 页改了输出目录：只重算目标路径，不重新识别。"""
+        if self.manager is None:
+            return
+        old_dir = self.task_config.output.output_dir
+        ok, error = self.manager.set_output_dir(path)
+        if not ok:
+            QMessageBox.warning(self, '输出目录不可用', error)
+            self.ocr_page.set_output_dir(old_dir)
+            return
+        new_dir = self.manager.config.output.output_dir
+        self.task_config.output.output_dir = new_dir
+        self.settings_page.set_output_dir(new_dir)
+        self.ocr_page.refresh_records()
+        self._append_log(f'输出目录已改为：{new_dir}')
+        self._update_status('输出目录已更新：文件名已重新计算，无需重新 OCR')
 
     def _on_ocr_done(self, summary) -> None:
         was_canceled = bool(self.worker is not None and self.worker.canceled)

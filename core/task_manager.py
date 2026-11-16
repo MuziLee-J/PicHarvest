@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import time
 from typing import Callable, Optional
@@ -22,8 +23,9 @@ from core.path_matcher import PathTemplate, describe_template_effect, normalize_
 from core.scanner import Scanner, ScanError
 from models import (ExecutionResult, ExtractMethod, ImageRecord, ProgressEvent,
                     ScanResult, Status, TaskConfig, TaskSummary, now_text)
-from ocr.engine import OcrUnavailable, get_engine, reset_engines
+from ocr.engine import OcrUnavailable, OcrResult, get_engine, reset_engines
 from ocr.parser import parse as parse_ocr_text
+from ocr.worker_pool import OcrWorkerPool, resolve_workers
 from ocr.suggester import NameSuggester
 from utils import file_utils
 from utils.logger import get_logger
@@ -112,15 +114,21 @@ class TaskManager:
 
     # ================================================================ OCR
 
-    def ensure_engine(self):
+    def ensure_engine(self, limit: int | None = None):
         """获取（并按需加载）OCR 引擎。
 
         use_process=True 时返回子进程代理引擎 —— 只有它才能被真正强制停止。
+        limit: 本次待识别张数。只有一张图时不必拉起 4 个进程白占内存，
+               并发数会按实际待处理量收敛。
         """
         with self._lock:
             cfg = self.config.ocr
+            wanted = resolve_workers(cfg.workers)
+            if limit is not None and limit > 0:
+                wanted = min(wanted, int(limit))
+            wanted = max(1, wanted)
             key = (cfg.engine, cfg.use_process, cfg.rec_model_path,
-                   cfg.det_model_path, cfg.startup_timeout)
+                   cfg.det_model_path, cfg.startup_timeout, wanted)
             if self._engine is not None and self._engine_key == key:
                 return self._engine
 
@@ -130,12 +138,20 @@ class TaskManager:
 
             if cfg.use_process and cfg.engine != 'none':
                 try:
-                    from ocr.process_engine import ProcessOcrEngine
-                    self._engine = ProcessOcrEngine(
-                        prefer=cfg.engine,
-                        rec_model_path=cfg.rec_model_path,
-                        det_model_path=cfg.det_model_path,
-                        startup_timeout=cfg.startup_timeout)
+                    if wanted > 1:
+                        self._engine = OcrWorkerPool(
+                            wanted,
+                            prefer=cfg.engine,
+                            rec_model_path=cfg.rec_model_path,
+                            det_model_path=cfg.det_model_path,
+                            startup_timeout=cfg.startup_timeout)
+                    else:
+                        from ocr.process_engine import ProcessOcrEngine
+                        self._engine = ProcessOcrEngine(
+                            prefer=cfg.engine,
+                            rec_model_path=cfg.rec_model_path,
+                            det_model_path=cfg.det_model_path,
+                            startup_timeout=cfg.startup_timeout)
                     self._using_process = True
                     return self._engine
                 except Exception as exc:
@@ -147,11 +163,22 @@ class TaskManager:
             return self._engine
 
     @property
+    def ocr_workers(self) -> int:
+        """当前实际的 OCR 并发数（进程内模式恒为 1）。"""
+        if not self._using_process:
+            return 1
+        return int(getattr(self._engine, 'size', 1) or 1)
+
+    @property
     def engine_name(self) -> str:
         try:
             engine = self.ensure_engine()
             if self._using_process:
-                return f'{getattr(engine, "engine_label", engine.display_name)}（子进程）'
+                label = getattr(engine, 'engine_label', engine.display_name)
+                workers = self.ocr_workers
+                if workers > 1:
+                    return f'{label}（{workers} 个并发子进程）'
+                return f'{label}（子进程）'
             return engine.display_name
         except Exception:
             return '未知引擎'
@@ -206,7 +233,7 @@ class TaskManager:
         targets = self._select_for_ocr(records or self.records, only)
         summary = TaskSummary(started_at=time.time(), total=len(targets), selected=len(targets))
 
-        engine = self.ensure_engine()
+        engine = self.ensure_engine(limit=len(targets) or None)
 
         # 子进程模式：启动并等待模型就绪；失败则退回进程内模式
         if self.uses_process_ocr:
@@ -236,8 +263,29 @@ class TaskManager:
 
         suggester = NameSuggester(self.config.naming)
         cancel_event = cancel_event or threading.Event()
-        done = 0
 
+        workers = self.ocr_workers if self.uses_process_ocr else 1
+        if workers > 1 and len(targets) > 1:
+            if self.log:
+                self.log.info(f'并发识别：{workers} 个子进程同时处理 {len(targets)} 张图片')
+            self._run_ocr_parallel(targets, engine, suggester, summary,
+                                   progress_cb, cancel_event, pause_event, workers)
+        else:
+            self._run_ocr_serial(targets, engine, suggester, summary,
+                                 progress_cb, cancel_event, pause_event)
+
+        summary.finished_at = time.time()
+        if self.log:
+            self.log.info(f'OCR 完成：成功 {summary.ocr_ok}，失败 {summary.ocr_failed}，'
+                          f'需人工确认 {summary.needs_review}，耗时 {summary.elapsed_text}')
+        return summary
+
+    # ---------------------------------------------------------------- 串行 / 并发
+
+    def _run_ocr_serial(self, targets, engine, suggester, summary,
+                        progress_cb, cancel_event, pause_event) -> None:
+        """串行识别（进程内模式，或用户把并发设为 1）。"""
+        done = 0
         for record in targets:
             if cancel_event.is_set():
                 break
@@ -265,37 +313,128 @@ class TaskManager:
                     self.log.warn(f'单张 OCR 耗时 {elapsed:.1f} 秒，超过设定阈值 '
                                   f'{self.config.ocr.timeout_sec} 秒：{record.source_path}')
 
-            if record.ocr_text:
-                summary.ocr_ok += 1
-            else:
-                summary.ocr_failed += 1
-            if record.status == Status.NEEDS_REVIEW:
-                summary.needs_review += 1
+            self._account_result(record, summary)
+            if not self._emit_ocr_progress(record, summary, done, len(targets),
+                                           elapsed, progress_cb):
+                break
 
-            if progress_cb:
-                event = ProgressEvent(
-                    phase='ocr', current=done, total=len(targets),
-                    message=record.error or record.ocr_error or '',
-                    source=record.source_path,
-                    ocr_text=record.extracted_name or record.ocr_text[:80],
-                    status=record.status,
-                    success=summary.ocr_ok, failed=summary.ocr_failed,
-                    skipped=summary.skipped,
-                    extra={'method': record.extract_method,
-                           'confidence': record.ocr_confidence,
-                           'elapsed': round(elapsed, 2)},
-                )
-                try:
-                    if progress_cb(event) is False:
+    def _run_ocr_parallel(self, targets, engine, suggester, summary,
+                          progress_cb, cancel_event, pause_event, workers) -> None:
+        """并发识别：工作线程只做识别，主线程统一命名与计数。
+
+        为什么要分两段：命名要读写 correction_memory / suggester / 记录状态，
+        这些都不是线程安全的；把"重活（识别）"放线程里、"轻活（落库+命名）"
+        收回到主线程，既拿到并发，又不用给整条链路加锁。
+
+        取消：一置 cancel_event 就 kill 所有子进程，在途识别立即返回 canceled，
+        所以不会出现"点了停止还要等一张图跑完"。
+        """
+        total = len(targets)
+        pending = list(targets)
+        guard = threading.Lock()
+        results: queue.Queue = queue.Queue()
+        stop = threading.Event()
+        started = 0            # 已被取走的记录数（可能大于已完成的）
+        aborted = False        # progress_cb 返回 False：不再取新记录
+        warned_canceled = False
+
+        def take():
+            nonlocal started
+            with guard:
+                if stop.is_set() or cancel_event.is_set() or not pending:
+                    return None
+                record = pending.pop(0)
+                started += 1
+                return record
+
+        def worker() -> None:
+            while True:
+                record = take()
+                if record is None:
+                    return
+                while pause_event is not None and not pause_event.is_set():
+                    if cancel_event.is_set() or stop.is_set():
                         break
-                except Exception:
-                    pass
+                    time.sleep(0.1)
+                if cancel_event.is_set() or stop.is_set():
+                    results.put((record, OcrResult(error='已取消', canceled=True), 0.0))
+                    continue
+                began = time.time()
+                result = self._recognize(record, engine, cancel_event)
+                results.put((record, result, time.time() - began))
 
-        summary.finished_at = time.time()
-        if self.log:
-            self.log.info(f'OCR 完成：成功 {summary.ocr_ok}，失败 {summary.ocr_failed}，'
-                          f'需人工确认 {summary.needs_review}，耗时 {summary.elapsed_text}')
-        return summary
+        threads = [threading.Thread(target=worker, daemon=True, name=f'ocr-worker-{i + 1}')
+                   for i in range(max(1, min(workers, total)))]
+        for thread in threads:
+            thread.start()
+
+        done = 0
+        try:
+            while True:
+                if done >= started and not any(t.is_alive() for t in threads):
+                    break
+                try:
+                    record, result, elapsed = results.get(timeout=0.15)
+                except queue.Empty:
+                    if (cancel_event.is_set() or aborted) and not stop.is_set():
+                        stop.set()
+                        self.force_stop()
+                    continue
+
+                done += 1
+                self._apply_result(record, result, suggester)
+                record.ocr_done = record.ocr_done or bool(record.ocr_text)
+                self._account_result(record, summary)
+
+                if record.status == Status.CANCELED and not warned_canceled:
+                    warned_canceled = True
+                    if self.log:
+                        self.log.warn('识别已被用户强制停止，剩余文件保持未处理状态')
+
+                if not self._emit_ocr_progress(record, summary, done, total,
+                                               elapsed, progress_cb):
+                    aborted = True
+
+                if (cancel_event.is_set() or aborted) and not stop.is_set():
+                    stop.set()
+                    self.force_stop()
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join(timeout=5)
+
+    def _emit_ocr_progress(self, record, summary, done, total, elapsed,
+                           progress_cb) -> bool:
+        """发一条进度事件；返回 False 表示调用方要求中止。"""
+        if not progress_cb:
+            return True
+        event = ProgressEvent(
+            phase='ocr', current=done, total=total,
+            message=record.error or record.ocr_error or '',
+            source=record.source_path,
+            ocr_text=record.extracted_name or record.ocr_text[:80],
+            status=record.status,
+            success=summary.ocr_ok, failed=summary.ocr_failed,
+            skipped=summary.skipped,
+            # record_index 让并发的乱序结果也能定位到正确的表格行
+            extra={'method': record.extract_method,
+                   'confidence': record.ocr_confidence,
+                   'elapsed': round(elapsed, 2),
+                   'record_index': record.index},
+        )
+        try:
+            return progress_cb(event) is not False
+        except Exception:
+            return True
+
+    @staticmethod
+    def _account_result(record: ImageRecord, summary: TaskSummary) -> None:
+        if record.ocr_text:
+            summary.ocr_ok += 1
+        else:
+            summary.ocr_failed += 1
+        if record.status == Status.NEEDS_REVIEW:
+            summary.needs_review += 1
 
     @staticmethod
     def _select_for_ocr(records: list[ImageRecord], only: str) -> list[ImageRecord]:
@@ -307,16 +446,20 @@ class TaskManager:
 
     def _ocr_and_name(self, record: ImageRecord, engine, suggester: NameSuggester,
                       cancel_event=None) -> None:
-        """对单个文件执行 OCR + 命名。异常全部内部消化。
+        """串行路径：识别 + 命名。异常全部内部消化。
 
         注意：识别走 recognize_path()，子进程引擎会把整个推理放进子进程，
         因此 cancel_event 一置位就能立刻杀死进程，不必等当前图片跑完。
         """
-        record.ocr_error = None
-        cfg = self.config.ocr
+        result = self._recognize(record, engine, cancel_event)
+        self._apply_result(record, result, suggester)
 
+    def _recognize(self, record: ImageRecord, engine,
+                   cancel_event=None) -> OcrResult:
+        """只做识别（并发时会被多个线程同时调用，不能碰任何共享状态）。"""
+        cfg = self.config.ocr
         try:
-            result = engine.recognize_path(
+            return engine.recognize_path(
                 record.source_path,
                 preset=cfg.preprocess,
                 max_side=cfg.max_side,
@@ -324,16 +467,15 @@ class TaskManager:
                 cancel_event=cancel_event,
             )
         except Exception as exc:
-            result = None
-            record.ocr_error = f'OCR 调用异常：{exc}'
+            return OcrResult(error=f'OCR 调用异常：{exc}')
+
+    def _apply_result(self, record: ImageRecord, result: OcrResult | None,
+                      suggester: NameSuggester) -> None:
+        """把识别结果写回记录并生成命名建议（只在单线程里调用）。"""
+        record.ocr_error = None
 
         if result is None:
-            record.ocr_text = ''
-            record.extracted_name = ''
-            record.status = Status.NEEDS_REVIEW
-            record.error = record.ocr_error
-            self._log_ocr(record)
-            return
+            result = OcrResult(error='OCR 未返回结果')
 
         if result.canceled:
             record.status = Status.CANCELED
@@ -518,6 +660,39 @@ class TaskManager:
         else:
             record.status = Status.PENDING
         record.error = None
+
+    def set_output_dir(self, path: str) -> tuple[bool, str]:
+        """OCR 之后修改输出目录：只重算目标路径，不用重新识别。
+
+        用户常见失误：一开始把输出目录选成了源目录里的某个子文件夹。
+        OCR 跑完才发现，若是只能重来一遍就很气人。这里只改配置 + 重算
+        final_filename / dest_path，识别结果全部保留。
+        """
+        path = (path or '').strip().strip('"')
+        if not path:
+            return False, '输出目录不能为空'
+        try:
+            path = os.path.abspath(os.path.expanduser(path))
+        except Exception as exc:
+            return False, f'路径无效：{exc}'
+        root = (self.config.rule.root_dir or '').strip()
+        if root and os.path.normcase(os.path.abspath(root)) == os.path.normcase(path):
+            return False, '输出目录不能与扫描目录相同（源文件只读）'
+        if os.path.exists(path) and not os.path.isdir(path):
+            return False, '该路径已存在且不是文件夹'
+        try:
+            file_utils.ensure_dir(path)
+        except Exception as exc:
+            return False, f'无法创建输出目录：{exc}'
+
+        self.config.output.output_dir = path
+        try:
+            self.rebuild_names(only_selected=True)
+        except TaskError as exc:
+            return False, str(exc)
+        if self.log:
+            self.log.info(f'输出目录已改为 {path}（文件名已重新计算，无需重新 OCR）')
+        return True, ''
 
     def rebuild_names(self, only_selected: bool = True) -> dict:
         """根据当前 extracted_name / 人工覆盖，重新分配最终文件名。"""

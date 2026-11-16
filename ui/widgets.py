@@ -562,3 +562,71 @@ def open_path(path: str) -> None:
     from utils import file_utils
     if path:
         file_utils.open_in_explorer(path)
+
+
+class CollapsibleSection(QWidget):
+    """可折叠的"高级选项"容器。
+
+    主界面只保留最常用的设置，把"调参才用得到"的项收进这里：
+    点标题展开，再点收起。收起状态下内容完全不占高度，
+    但控件本身仍然存在，读取/写入配置的代码无需改动。
+
+    用法：
+        sec = CollapsibleSection('高级选项（报告格式）')
+        sec.addWidget(self.report_check)
+        layout.addWidget(sec)
+    """
+
+    def __init__(self, title: str = '高级选项', parent=None, expanded: bool = False):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QToolButton
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+
+        self.toggle = QToolButton()
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(expanded)
+        self.toggle.setAutoRaise(True)
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded
+                                 else Qt.ArrowType.RightArrow)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setStyleSheet(
+            'QToolButton { border:none; color:#245a91; padding:2px 0; }'
+            'QToolButton:hover { color:#1a7fd4; }')
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle.toggled.connect(self._on_toggled)
+        outer.addWidget(self.toggle)
+
+        self.body = QWidget()
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(18, 2, 0, 2)
+        self.body_layout.setSpacing(6)
+        outer.addWidget(self.body)
+        self.body.setVisible(expanded)
+
+    # ---------------------------------------------------------------- 内容
+
+    def addWidget(self, widget) -> None:          # noqa: N802 (Qt 风格)
+        self.body_layout.addWidget(widget)
+
+    def addLayout(self, layout) -> None:          # noqa: N802 (Qt 风格)
+        self.body_layout.addLayout(layout)
+
+    # ---------------------------------------------------------------- 状态
+
+    def _on_toggled(self, expanded: bool) -> None:
+        self.body.setVisible(expanded)
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded
+                                 else Qt.ArrowType.RightArrow)
+
+    def isExpanded(self) -> bool:                 # noqa: N802 (Qt 风格)
+        return self.toggle.isChecked()
+
+    def setExpanded(self, expanded: bool) -> None:   # noqa: N802 (Qt 风格)
+        self.toggle.setChecked(bool(expanded))
+
+    def setTitle(self, title: str) -> None:       # noqa: N802 (Qt 风格)
+        self.toggle.setText(title)

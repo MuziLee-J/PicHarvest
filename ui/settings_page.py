@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QFileDialog,
 from core.path_matcher import (build_template, describe_template_effect,
                                normalize_template, validate_template)
 from models import ExtractRule, NamingConfig, OcrConfig, OutputConfig, TaskConfig
-from ui.widgets import make_hint, make_separator
+from ui.widgets import CollapsibleSection, make_hint, make_separator
 from utils import file_utils
 from utils.logger import get_logger
 
@@ -226,6 +226,8 @@ class SettingsPage(QWidget):
         policy_row.addStretch(1)
         layout.addLayout(policy_row)
 
+        # 报告格式属于"偶尔才改"的项：收进可折叠的高级选项，主界面更清爽
+        report_section = CollapsibleSection('高级选项（报告格式）')
         report_row = QHBoxLayout()
         self.report_check = QCheckBox('任务结束后生成处理报告')
         self.report_check.setChecked(True)
@@ -239,7 +241,8 @@ class SettingsPage(QWidget):
                       self.report_excel_check):
             report_row.addWidget(check)
         report_row.addStretch(1)
-        layout.addLayout(report_row)
+        report_section.addLayout(report_row)
+        layout.addWidget(report_section)
 
         layout.addWidget(make_hint(
             '安全说明：程序只做"复制"，原始文件永远保持原样；'
@@ -275,6 +278,9 @@ class SettingsPage(QWidget):
 
         layout.addWidget(make_separator())
 
+        # 来源信息 / AI / 兜底命名：都属于"默认值够用、调参才动"的高级项
+        advanced = CollapsibleSection('高级选项（来源信息 / AI / 兜底命名）')
+
         source_row = QHBoxLayout()
         self.keep_source_check = QCheckBox('保留来源文件夹信息')
         self.keep_source_check.setChecked(True)
@@ -301,7 +307,7 @@ class SettingsPage(QWidget):
         self.source_level_combo.addItem('第 3 层', 2)
         source_row.addWidget(self.source_level_combo)
         source_row.addStretch(1)
-        layout.addLayout(source_row)
+        advanced.addLayout(source_row)
 
         # AI 选项
         ai_row = QHBoxLayout()
@@ -315,7 +321,7 @@ class SettingsPage(QWidget):
         self.ai_threshold_combo.setCurrentIndex(1)
         ai_row.addWidget(self.ai_threshold_combo)
         ai_row.addStretch(1)
-        layout.addLayout(ai_row)
+        advanced.addLayout(ai_row)
 
         ollama_row = QHBoxLayout()
         self.ollama_check = QCheckBox('使用本地大模型（Ollama，可选）')
@@ -330,8 +336,8 @@ class SettingsPage(QWidget):
         self.ollama_model_edit.setEnabled(False)
         ollama_row.addWidget(self.ollama_model_edit)
         ollama_row.addStretch(1)
-        layout.addLayout(ollama_row)
-        layout.addWidget(make_hint(
+        advanced.addLayout(ollama_row)
+        advanced.addWidget(make_hint(
             '本程序默认完全离线：不上传图片、不上传 OCR 文本。'
             '本地大模型只能填写 127.0.0.1 / localhost 地址，从机制上不可能外传数据。'))
 
@@ -342,40 +348,51 @@ class SettingsPage(QWidget):
         fallback_row.addWidget(self.fallback_source_check)
         fallback_row.addWidget(self.fallback_original_check)
         fallback_row.addStretch(1)
-        layout.addLayout(fallback_row)
+        advanced.addLayout(fallback_row)
+        layout.addWidget(advanced)
         return group
 
     # ---------------------------------------------------------------- OCR
 
     def _build_ocr_group(self) -> QGroupBox:
         group = QGroupBox('4. OCR 设置')
-        layout = QGridLayout(group)
+        layout = QVBoxLayout(group)
 
-        layout.addWidget(QLabel('识别引擎：'), 0, 0)
+        # 常用项常驻可见：引擎、并发、运行方式、超时
+        visible = QGridLayout()
+        visible.addWidget(QLabel('识别引擎：'), 0, 0)
         self.engine_combo = QComboBox()
         self.engine_combo.addItem('自动选择（推荐）', 'auto')
         self.engine_combo.addItem('PaddleOCR（最准，需自行安装）', 'paddle')
         self.engine_combo.addItem('RapidOCR（轻量，ONNXRuntime）', 'rapid')
         self.engine_combo.addItem('不使用 OCR（仅按来源命名）', 'none')
-        layout.addWidget(self.engine_combo, 0, 1)
+        visible.addWidget(self.engine_combo, 0, 1)
 
         self.engine_status_label = QLabel('')
         self.engine_status_label.setObjectName('hint')
-        layout.addWidget(self.engine_status_label, 0, 2, 1, 2)
+        visible.addWidget(self.engine_status_label, 0, 2, 1, 2)
 
-        layout.addWidget(QLabel('图像预处理：'), 1, 0)
-        self.preprocess_combo = QComboBox()
-        for value, label in PREPROCESS_ITEMS:
-            self.preprocess_combo.addItem(label, value)
-        layout.addWidget(self.preprocess_combo, 1, 1)
-        layout.addWidget(make_hint(
-            '预处理只在内存中进行，用于提升识别率，不会改动原始图片。'), 2, 1, 1, 3)
+        # 并发数直接决定速度，放在第一屏
+        visible.addWidget(QLabel('同时识别：'), 1, 0)
+        workers_row = QHBoxLayout()
+        self.workers_combo = QComboBox()
+        for value, label in ((1, '1 个（串行，推荐）'),
+                             (2, '2 个（CPU 有富余时更快）'),
+                             (3, '3 个'), (4, '4 个'),
+                             (6, '6 个'), (8, '8 个')):
+            self.workers_combo.addItem(label, value)
+        self.workers_combo.setToolTip(
+            '同时启动几个 OCR 子进程。\n'
+            'OCR 默认已占满所有 CPU 核心，此时多开进程只会互相抢核、\n'
+            '反而更慢（本机实测 4 进程约为串行的 1.7 倍耗时）。\n'
+            '只有单进程明显吃不满 CPU 时才建议调大；每个进程约占 200–400MB 内存。')
+        self.workers_combo.setMaximumWidth(230)
+        workers_row.addWidget(self.workers_combo)
+        workers_row.addWidget(make_hint(
+            '一般保持 1 个即可；识别慢时优先调低下面的“识别精度”。'))
+        workers_row.addStretch(1)
+        visible.addLayout(workers_row, 1, 1, 1, 3)
 
-        self.recheck_button = QPushButton('检测 OCR 环境')
-        self.recheck_button.clicked.connect(self.refresh_engine_status)
-        layout.addWidget(self.recheck_button, 2, 0)
-
-        # --- 运行方式与超时 ---
         run_row = QHBoxLayout()
         self.use_process_check = QCheckBox('子进程隔离（支持"强制停止"与单张超时）')
         self.use_process_check.setChecked(True)
@@ -393,9 +410,24 @@ class SettingsPage(QWidget):
         self.timeout_spin.setToolTip('超过该时间会自动终止该张识别，继续下一张')
         run_row.addWidget(self.timeout_spin)
         run_row.addStretch(1)
-        layout.addLayout(run_row, 3, 0, 1, 4)
+        visible.addLayout(run_row, 2, 0, 1, 4)
+        layout.addLayout(visible)
 
-        # --- 自定义模型（提升精度，不需要训练）---
+        # 调参才会动的项：收进高级选项
+        advanced = CollapsibleSection('高级选项（预处理 / 自定义模型）')
+        grid = QGridLayout()
+        grid.addWidget(QLabel('图像预处理：'), 0, 0)
+        self.preprocess_combo = QComboBox()
+        for value, label in PREPROCESS_ITEMS:
+            self.preprocess_combo.addItem(label, value)
+        grid.addWidget(self.preprocess_combo, 0, 1, 1, 3)
+
+        self.recheck_button = QPushButton('检测 OCR 环境')
+        self.recheck_button.clicked.connect(self.refresh_engine_status)
+        grid.addWidget(self.recheck_button, 1, 0)
+        grid.addWidget(make_hint(
+            '预处理只在内存中进行，用于提升识别率，不会改动原始图片。'), 1, 1, 1, 3)
+
         model_row = QHBoxLayout()
         self.rec_model_edit = QLineEdit()
         self.rec_model_edit.setPlaceholderText('留空使用内置模型')
@@ -406,7 +438,7 @@ class SettingsPage(QWidget):
         browse_rec = QPushButton('浏览…')
         browse_rec.clicked.connect(lambda: self._pick_model(self.rec_model_edit))
         model_row.addWidget(browse_rec)
-        layout.addLayout(model_row, 4, 0, 1, 4)
+        grid.addLayout(model_row, 2, 0, 1, 4)
 
         det_row = QHBoxLayout()
         self.det_model_edit = QLineEdit()
@@ -417,11 +449,25 @@ class SettingsPage(QWidget):
         browse_det = QPushButton('浏览…')
         browse_det.clicked.connect(lambda: self._pick_model(self.det_model_edit))
         det_row.addWidget(browse_det)
-        layout.addLayout(det_row, 5, 0, 1, 4)
+        grid.addLayout(det_row, 3, 0, 1, 4)
 
-        layout.addWidget(make_hint(
+        grid.addWidget(QLabel('识别精度：'), 4, 0)
+        self.max_side_combo = QComboBox()
+        for value, label in ((1200, '速度优先（1200，最快）'),
+                             (1600, '平衡（1600，推荐）'),
+                             (2200, '清晰（2200，小字/低清扫描）')):
+            self.max_side_combo.addItem(label, value)
+        self.max_side_combo.setToolTip(
+            '送入 OCR 的图片最长边。图片越大识别越准但越慢（耗时大致与像素数成正比）。\n'
+            '1600 对普通文档足够；字很小或扫描件很糊时再选 2200。')
+        self.max_side_combo.setMaximumWidth(260)
+        grid.addWidget(self.max_side_combo, 4, 1, 1, 3)
+
+        grid.addWidget(make_hint(
             '换更强的预训练模型比从头训练划算：不用标注、不用 GPU，'
-            '直接填模型目录即可。'), 6, 0, 1, 4)
+            '直接填模型目录即可。'), 5, 0, 1, 4)
+        advanced.addLayout(grid)
+        layout.addWidget(advanced)
         return group
 
     def _pick_model(self, edit: QLineEdit) -> None:
@@ -692,6 +738,10 @@ class SettingsPage(QWidget):
         self.preprocess_combo.setCurrentIndex(max(0, index))
         self.use_process_check.setChecked(bool(ocr_conf.use_process))
         self.timeout_spin.setValue(int(ocr_conf.timeout_sec or 60))
+        self.workers_combo.setCurrentIndex(
+            max(0, self.workers_combo.findData(int(ocr_conf.workers or 0))))
+        index = self.max_side_combo.findData(int(ocr_conf.max_side or 1600))
+        self.max_side_combo.setCurrentIndex(max(0, index))
         self.rec_model_edit.setText(ocr_conf.rec_model_path or '')
         self.det_model_edit.setText(ocr_conf.det_model_path or '')
 
@@ -757,6 +807,8 @@ class SettingsPage(QWidget):
                 preprocess=self.preprocess_combo.currentData() or 'standard',
                 timeout_sec=int(self.timeout_spin.value()),
                 use_process=self.use_process_check.isChecked(),
+                workers=int(self.workers_combo.currentData() or 1),
+                max_side=int(self.max_side_combo.currentData() or 1600),
                 rec_model_path=self.rec_model_edit.text().strip(),
                 det_model_path=self.det_model_edit.text().strip(),
             ),
@@ -779,6 +831,14 @@ class SettingsPage(QWidget):
             QMessageBox.warning(self, '请先完善设置', str(exc))
             return
         self.scan_requested.emit()
+
+    def set_output_dir(self, path: str) -> None:
+        """OCR 页改了输出目录后，回填设置页的输入框（保持两处一致）。"""
+        if (self.output_edit.text().strip() or '') == (path or '').strip():
+            return
+        self.output_edit.blockSignals(True)
+        self.output_edit.setText(path or '')
+        self.output_edit.blockSignals(False)
 
     def set_busy(self, busy: bool) -> None:
         self.scan_button.setEnabled(not busy)
