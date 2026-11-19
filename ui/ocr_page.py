@@ -61,6 +61,15 @@ class OcrPage(QWidget):
             '命名优先级：① 指定字段 → ② 本地 AI 判断 → ③ 人工确认。'
             '标记为"需人工确认"的文件，只有在您确认（或勾选下方的"包含未确认项"）后才会被复制。'))
 
+        # 降级提示：子进程 OCR 起不来时会退回进程内模式，行为不一样（P1-4）
+        self.degrade_banner = QLabel('')
+        self.degrade_banner.setWordWrap(True)
+        self.degrade_banner.setStyleSheet(
+            'color:#7a4b00; background:#fff8e6; border:1px solid #f0d48a;'
+            'border-radius:6px; padding:8px 10px;')
+        self.degrade_banner.setVisible(False)
+        layout.addWidget(self.degrade_banner)
+
         # OCR 进度（识别过程中显示，结束后隐藏）
         progress_row = QHBoxLayout()
         self.progress = QProgressBar()
@@ -265,6 +274,20 @@ class OcrPage(QWidget):
 
     def set_manager(self, manager) -> None:
         self.manager = manager
+
+    # ---------------------------------------------------------------- 降级提示
+
+    def show_degrade(self, reason: str) -> None:
+        """显示「已降级为进程内 OCR」的常驻提示（P1-4）。"""
+        text = (reason or '').strip() or 'OCR 子进程不可用'
+        self.degrade_banner.setText(
+            f'⚠ {text}　本次改用进程内 OCR：单张识别超时不会中断，'
+            '"强制停止"也不可用。关闭窗口会等到当前文件处理完。')
+        self.degrade_banner.setVisible(True)
+
+    def clear_degrade(self) -> None:
+        self.degrade_banner.clear()
+        self.degrade_banner.setVisible(False)
 
     # ---------------------------------------------------------------- 输出目录
 

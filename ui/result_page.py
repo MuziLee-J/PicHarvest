@@ -233,6 +233,23 @@ class ResultPage(QWidget):
         self.done_group.setVisible(True)
         self.set_conflicts(summary.conflicts)
 
+    def finish_with_error(self, title: str = '任务失败',
+                          reason: str = '') -> None:
+        """失败/中止收尾。
+
+        没有统计可展示，但必须把界面从"运行中"解出来：否则暂停/取消/强停
+        按钮仍然可点，而背后的任务早已结束（P2-10）。
+        """
+        self._running = False
+        self._paused = False
+        self.phase_label.setText(title)
+        self.busy_label.setText(reason or '任务已中止。')
+        self.pause_button.setText('暂停')
+        self.pause_button.setEnabled(False)
+        self.cancel_button.setEnabled(False)
+        self.force_stop_button.setEnabled(False)
+        self.done_group.setVisible(False)
+
     def show_undo_result(self, result: dict) -> None:
         text = (f'撤销完成：已删除 {result.get("deleted", 0)} 个文件，'
                 f'跳过 {result.get("skipped", 0)}，失败 {result.get("failed", 0)}。')

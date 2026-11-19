@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QRegularExpression, Qt, Signal
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QFileDialog,
                                QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
                                QLabel, QLineEdit, QPushButton, QRadioButton,
                                QScrollArea, QSizePolicy, QSpinBox, QStackedWidget,
                                QVBoxLayout, QWidget)
+from PySide6.QtGui import QRegularExpressionValidator
 
 from core.path_matcher import (build_template, describe_template_effect,
                                normalize_template, validate_template)
@@ -297,6 +298,11 @@ class SettingsPage(QWidget):
         source_row.addWidget(QLabel('连接符：'))
         self.separator_edit = QLineEdit('_')
         self.separator_edit.setMaximumWidth(50)
+        # 连接符会被原样插进文件名：带路径分隔符会拼出子目录，带反斜杠会让
+        # 清洗函数里的 re.sub 抛错，所以在这里直接挡掉（P2-7）。
+        self.separator_edit.setValidator(QRegularExpressionValidator(
+            QRegularExpression(r'[^\\/:*?"<>|]{0,8}'), self))
+        self.separator_edit.setToolTip('不能包含 \\ / : * ? " < > |，最多 8 个字符')
         self.separator_edit.textChanged.connect(self._refresh_rule_preview)
         source_row.addWidget(self.separator_edit)
 
@@ -781,7 +787,7 @@ class SettingsPage(QWidget):
         output_dir = self.output_edit.text().strip()
         if not output_dir:
             raise ValueError('请先选择输出目录')
-        if os.path.abspath(output_dir) == os.path.abspath(root):
+        if file_utils.same_path(output_dir, root):
             raise ValueError('输出目录不能与根目录相同，否则会污染原始数据')
 
         formats = []

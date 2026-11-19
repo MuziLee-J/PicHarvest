@@ -30,6 +30,26 @@ logger = get_logger('extractor')
 MAX_REALLOCATE = 50
 
 
+def is_inside_output(dest_path: str, output_dir: str, filename: str) -> bool:
+    """落点是否真的在输出目录之内。
+
+    两道条件缺一不可：
+    1. `filename` 必须是一个纯文件名 —— 含路径分隔符或为 `.`/`..` 时
+       `os.path.join` 会跳到别的目录（绝对路径则直接吞掉 `dest_dir`）；
+    2. 归一化后的路径必须带输出目录前缀。
+    """
+    if not filename or filename != os.path.basename(filename):
+        return False
+    if filename in ('.', '..'):
+        return False
+    if not output_dir:
+        return False
+    root = file_utils.norm_path_key(output_dir).rstrip('/')
+    if not root:
+        return False
+    return file_utils.norm_path_key(dest_path).startswith(root + '/')
+
+
 @dataclass
 class CopyOutcome:
     """单个文件的复制结果。"""
@@ -252,6 +272,12 @@ class Extractor:
                                        conflict_note=allocation.note)
 
                 dest_path = os.path.join(dest_dir, allocation.filename)
+                if not is_inside_output(dest_path, self.output.output_dir,
+                                        allocation.filename):
+                    # 最后一道防线：前面任何一处漏了清洗，也不允许写到输出目录之外
+                    self.allocator.release(dest_dir, allocation.filename)
+                    return CopyOutcome(ok=False, error='目标路径越界，已拒绝写入',
+                                       final_name=allocation.filename)
                 try:
                     file_utils.copy_no_overwrite(record.source_path, dest_path)
                 except FileExistsError:

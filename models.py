@@ -382,6 +382,7 @@ class ScanResult:
     elapsed: float = 0.0
     errors: list = field(default_factory=list)   # [(path, error)]
     matched_all: int = 0
+    canceled: bool = False      # 用户在扫描中途取消（files 里是已找到的部分结果）
 
     @property
     def count(self) -> int:

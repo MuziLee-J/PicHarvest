@@ -53,6 +53,9 @@ class TaskManager:
         self._engine = None
         self._engine_key = ''
         self._using_process = False
+        #: 子进程 OCR 不可用时的降级说明（空串表示没有降级）
+        #: UI 读它来提示用户"本次没有强停、单张超时也不会中断"（P1-4）
+        self.degraded_reason = ''
         self._lock = threading.RLock()
         # 纠正记忆：把用户的人工修正变成下一次的自动判断依据
         self.correction_memory = None
@@ -155,12 +158,27 @@ class TaskManager:
                     self._using_process = True
                     return self._engine
                 except Exception as exc:
-                    logger.warning('子进程 OCR 初始化失败，退回进程内模式：%s', exc)
+                    self._degrade_to_inprocess(exc, '初始化')
 
             self._engine = get_engine(
                 cfg.engine, rec_model_path=cfg.rec_model_path,
                 det_model_path=cfg.det_model_path)
             return self._engine
+
+    def _degrade_to_inprocess(self, error, stage: str = '启动') -> None:
+        """记录一次「子进程不可用 → 进程内模式」的降级（P1-4）。
+
+        进程内模式没有强停、单张超时也不会中断，属于实打实的行为降级。
+        以前这里只有一条 warning 日志，用户完全看不见；现在把原因记在
+        `degraded_reason` 上，由 UI 常驻提示。
+        """
+        reason = str(error or '').strip() or '未知原因'
+        self.degraded_reason = f'OCR 子进程{stage}失败：{reason}'
+        self._using_process = False
+        logger.error('子进程 OCR %s失败，退回进程内模式：%s', stage, reason)
+        if self.log:
+            self.log.error(f'OCR 子进程{stage}失败，已退回进程内模式：{reason}')
+            self.log.warn('降级后：单张识别超时不会自动中断，"强制停止"也不可用。')
 
     @property
     def ocr_workers(self) -> int:
@@ -241,13 +259,11 @@ class TaskManager:
                 self.log.info('正在启动 OCR 子进程（首次需加载模型，请稍候）…')
             ok, error = engine.start()
             if not ok:
-                if self.log:
-                    self.log.warn(f'OCR 子进程启动失败，改用进程内模式：{error}')
+                self._degrade_to_inprocess(error, '启动')
                 cfg = self.config.ocr
                 self._engine = get_engine(cfg.engine,
                                           rec_model_path=cfg.rec_model_path,
                                           det_model_path=cfg.det_model_path)
-                self._using_process = False
                 engine = self._engine
 
         if not self.uses_process_ocr:
@@ -637,15 +653,13 @@ class TaskManager:
 
     def set_final_filename(self, record: ImageRecord, filename: str) -> None:
         """人工直接指定最终文件名（优先级最高）。"""
-        from utils.validators import is_safe_filename, sanitize_filename
-        filename = (filename or '').strip()
+        from core.filename_manager import sanitize_manual_name
+        filename, note = sanitize_manual_name(filename, self.config.naming.max_stem_len)
         if not filename:
             record.manual_override = False
             return
-        safe, reason = is_safe_filename(filename)
-        if not safe:
-            filename = sanitize_filename(filename, '_', self.config.naming.max_stem_len)
-            record.conflict_note = f'文件名已自动修正：{reason}'
+        if note:
+            record.conflict_note = note
         record.final_filename = filename
         record.manual_override = True
         record.status = Status.READY
@@ -676,7 +690,7 @@ class TaskManager:
         except Exception as exc:
             return False, f'路径无效：{exc}'
         root = (self.config.rule.root_dir or '').strip()
-        if root and os.path.normcase(os.path.abspath(root)) == os.path.normcase(path):
+        if root and file_utils.same_path(root, path):
             return False, '输出目录不能与扫描目录相同（源文件只读）'
         if os.path.exists(path) and not os.path.isdir(path):
             return False, '该路径已存在且不是文件夹'
@@ -732,7 +746,9 @@ class TaskManager:
                 self.db.update_task(
                     self.task_id, total=summary.total, success=summary.success,
                     failed=summary.failed, skipped=summary.skipped,
-                    needs_review=summary.needs_review, status='finished')
+                    needs_review=summary.needs_review,
+                    output_dir=self.config.output.output_dir or '',
+                    status='finished')
                 self.db.mark_finished(self.task_id, 'finished')
             except Exception as exc:
                 logger.warning('写回任务统计失败：%s', exc)

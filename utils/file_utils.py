@@ -311,6 +311,21 @@ def make_relative(path: str, root: str) -> str:
     return rel.replace('\\', '/')
 
 
+def same_path(left: str, right: str) -> bool:
+    """两个路径是否指向同一位置。
+
+    直接比较 abspath 字符串会被大小写（`d:/data` 与 `D:/Data`）、正斜杠与
+    反斜杠混用、以及相对写法骗过去，于是「输出目录不能与根目录相同」这条
+    校验形同虚设（P2-12）。统一走 norm_path_key 比较。
+    """
+    if not left or not right:
+        return False
+    try:
+        return norm_path_key(left) == norm_path_key(right)
+    except (TypeError, ValueError):
+        return False
+
+
 def norm_path_key(path: str) -> str:
     """用于比较的路径键（绝对、小写、统一分隔符）。"""
     return os.path.normcase(os.path.abspath(os.fspath(path))).replace('\\', '/')
