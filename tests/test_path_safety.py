@@ -63,6 +63,20 @@ class TestSeparator(unittest.TestCase):
         self.assertEqual(compose_filename('张三', 'CASE001', '.jpg', naming),
                          'CASE001_张三.jpg')
 
+    def test_legacy_separator_with_spaces_is_trimmed(self):
+        # 老配置里可能是 ' - '（带空格）：升级后输出变成 '-'，且设置页显示同值
+        naming = NamingConfig(separator=' - ')
+        self.assertEqual(compose_filename('张三', 'CASE001', '.jpg', naming),
+                         'CASE001-张三.jpg')
+        self.assertEqual(sanitize_separator(' - '), '-')
+
+    def test_overlong_separator_is_truncated_consistently(self):
+        raw = '_' * 12
+        naming = NamingConfig(separator=raw)
+        self.assertEqual(sanitize_separator(raw), '_' * 8)
+        self.assertEqual(compose_filename('张三', 'CASE001', '.jpg', naming),
+                         'CASE001' + '_' * 8 + '张三.jpg')
+
 
 class TestManualName(unittest.TestCase):
     """P1-1：手工名的清洗规则。"""

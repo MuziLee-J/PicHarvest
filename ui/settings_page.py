@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QFileDialog,
                                QVBoxLayout, QWidget)
 from PySide6.QtGui import QRegularExpressionValidator
 
+from core.filename_manager import sanitize_separator
 from core.path_matcher import (build_template, describe_template_effect,
                                normalize_template, validate_template)
 from models import ExtractRule, NamingConfig, OcrConfig, OutputConfig, TaskConfig
@@ -713,7 +714,8 @@ class SettingsPage(QWidget):
         self.keep_source_check.setChecked(naming.keep_source)
         index = self.source_pos_combo.findData(naming.source_position)
         self.source_pos_combo.setCurrentIndex(max(0, index))
-        self.separator_edit.setText(naming.separator or '_')
+        # 显示清洗后的值：早期版本没有字符/长度限制，直接显示原值会让预览与实际输出不一致。
+        self.separator_edit.setText(sanitize_separator(naming.separator or '_'))
         self.source_level_combo.setCurrentIndex(
             max(0, min(2, int(naming.source_level or 0))))
         self.ai_check.setChecked(naming.ai_enabled)
@@ -760,7 +762,7 @@ class SettingsPage(QWidget):
             fields=fields or ['姓名'],
             keep_source=self.keep_source_check.isChecked(),
             source_position=self.source_pos_combo.currentData() or 'prefix',
-            separator=(self.separator_edit.text() or '_'),
+            separator=sanitize_separator(self.separator_edit.text()),
             source_level=int(self.source_level_combo.currentData() or 0),
             ai_enabled=self.ai_check.isChecked(),
             ai_min_confidence=float(self.ai_threshold_combo.currentData() or 0.6),
