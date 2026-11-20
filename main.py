@@ -285,6 +285,18 @@ def run_selftest() -> int:
 
 # ---------------------------------------------------------------- 主流程
 
+def _apply_window_icon(app) -> None:
+    """给窗口/任务栏挂上程序图标。图标缺失时静默跳过，不影响启动。"""
+    path = os.path.join(app_base_dir(), 'PicHarvest.ico')
+    if not os.path.isfile(path):
+        return
+    try:
+        from PySide6.QtGui import QIcon
+        app.setWindowIcon(QIcon(path))
+    except Exception:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     prepare_environment()
     argv = argv if argv is not None else sys.argv
@@ -315,6 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName('PicHarvest')
     app.setApplicationDisplayName('图片智能提取与 OCR 命名工具')
     app.setOrganizationName('PicHarvest')
+    _apply_window_icon(app)
 
     from ui.style import apply_style
     apply_style(app)
