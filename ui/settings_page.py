@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QRegularExpression, Qt, Signal
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QFileDialog,
                                QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
                                QLabel, QLineEdit, QPushButton, QRadioButton,
                                QScrollArea, QSizePolicy, QSpinBox, QStackedWidget,
                                QVBoxLayout, QWidget)
+from PySide6.QtGui import QRegularExpressionValidator
 
+from core.filename_manager import sanitize_separator
 from core.path_matcher import (build_template, describe_template_effect,
                                normalize_template, validate_template)
 from models import ExtractRule, NamingConfig, OcrConfig, OutputConfig, TaskConfig
@@ -297,6 +299,11 @@ class SettingsPage(QWidget):
         source_row.addWidget(QLabel('连接符：'))
         self.separator_edit = QLineEdit('_')
         self.separator_edit.setMaximumWidth(50)
+        # 连接符会被原样插进文件名：带路径分隔符会拼出子目录，带反斜杠会让
+        # 清洗函数里的 re.sub 抛错，所以在这里直接挡掉（P2-7）。
+        self.separator_edit.setValidator(QRegularExpressionValidator(
+            QRegularExpression(r'[^\\/:*?"<>|]{0,8}'), self))
+        self.separator_edit.setToolTip('不能包含 \\ / : * ? " < > |，最多 8 个字符')
         self.separator_edit.textChanged.connect(self._refresh_rule_preview)
         source_row.addWidget(self.separator_edit)
 
@@ -707,7 +714,8 @@ class SettingsPage(QWidget):
         self.keep_source_check.setChecked(naming.keep_source)
         index = self.source_pos_combo.findData(naming.source_position)
         self.source_pos_combo.setCurrentIndex(max(0, index))
-        self.separator_edit.setText(naming.separator or '_')
+        # 显示清洗后的值：早期版本没有字符/长度限制，直接显示原值会让预览与实际输出不一致。
+        self.separator_edit.setText(sanitize_separator(naming.separator or '_'))
         self.source_level_combo.setCurrentIndex(
             max(0, min(2, int(naming.source_level or 0))))
         self.ai_check.setChecked(naming.ai_enabled)
@@ -754,7 +762,7 @@ class SettingsPage(QWidget):
             fields=fields or ['姓名'],
             keep_source=self.keep_source_check.isChecked(),
             source_position=self.source_pos_combo.currentData() or 'prefix',
-            separator=(self.separator_edit.text() or '_'),
+            separator=sanitize_separator(self.separator_edit.text()),
             source_level=int(self.source_level_combo.currentData() or 0),
             ai_enabled=self.ai_check.isChecked(),
             ai_min_confidence=float(self.ai_threshold_combo.currentData() or 0.6),
@@ -781,7 +789,7 @@ class SettingsPage(QWidget):
         output_dir = self.output_edit.text().strip()
         if not output_dir:
             raise ValueError('请先选择输出目录')
-        if os.path.abspath(output_dir) == os.path.abspath(root):
+        if file_utils.same_path(output_dir, root):
             raise ValueError('输出目录不能与根目录相同，否则会污染原始数据')
 
         formats = []

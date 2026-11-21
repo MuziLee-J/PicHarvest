@@ -114,11 +114,6 @@ def export_training_data(records: list[ImageRecord], out_dir: str,
     manifest_rows: list[list] = []
     review_rows: list[list] = []
 
-    try:
-        from PIL import Image
-    except ImportError:
-        Image = None
-
     for record in records:
         if record.status in (Status.FAILED, Status.CANCELED) or not record.ocr_text:
             stats['no_text'] += 1
@@ -142,29 +137,37 @@ def export_training_data(records: list[ImageRecord], out_dir: str,
                                 record.extracted_name, '该行没有可用的文本框'])
             continue
 
-        original_size = file_utils.get_image_size(record.source_path)
-        if not original_size:
-            stats['errors'] += 1
-            continue
-
-        mapped = _map_box_to_original(box, record.ocr_image_size, original_size)
-        if mapped is None:
-            stats['no_box'] += 1
-            review_rows.append([record.index, record.source_path, label,
-                                record.extracted_name, '文本框换算后过小'])
-            continue
-
-        crop_name = f'{record.index:05d}.jpg'
-        crop_path = os.path.join(crops_dir, crop_name)
+        # 用与 OCR 同一个加载函数取图：它内部做了 EXIF 转正，所以这里的尺寸
+        # 与 record.ocr_image_size 属于同一坐标系。直接读 Image.open().size 拿到
+        # 的是"旋转前"的宽高，竖拍照片会让 x/y 比例互换，裁剪框整体错位。
         try:
-            with Image.open(record.source_path) as image:
-                image = image.convert('RGB')
-                crop = image.crop(tuple(mapped))
+            image = file_utils.load_image_rgb(record.source_path)
+        except Exception as exc:
+            stats['errors'] += 1
+            logger.warning('读取原图失败 %s：%s', record.source_path, exc)
+            continue
+
+        try:
+            mapped = _map_box_to_original(box, record.ocr_image_size, image.size)
+            if mapped is None:
+                stats['no_box'] += 1
+                review_rows.append([record.index, record.source_path, label,
+                                    record.extracted_name, '文本框换算后过小'])
+                continue
+
+            crop_name = f'{record.index:05d}.jpg'
+            crop_path = os.path.join(crops_dir, crop_name)
+            crop = image.crop(tuple(mapped))
+            try:
                 crop.save(crop_path, 'JPEG', quality=95)
+            finally:
+                crop.close()
         except Exception as exc:
             stats['errors'] += 1
             logger.warning('裁剪失败 %s：%s', record.source_path, exc)
             continue
+        finally:
+            image.close()
 
         stats['exported'] += 1
         train_lines.append(f'crops/{crop_name}\t{label}')

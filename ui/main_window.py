@@ -47,12 +47,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle('图片智能提取与 OCR 命名工具')
         self.resize(1360, 880)
-        self.setMinimumSize(1080, 700)
+        # 下限按「OCR 与命名」页算：右侧细节栏最窄要放得下五个按钮（≈440），
+        # 左边表格还要塞下固定列宽，窗口再窄就只能出滚动条了。
+        self.setMinimumSize(1180, 700)
 
         self.app_config = get_config()
         self.database = get_database()
         self.manager: TaskManager | None = None
         self.worker = None                      # 当前后台线程（由 finished 信号释放）
+        self._degrade_seen = ''                 # 已经提示过的降级原因（避免每帧重设）
         self.task_config: TaskConfig = self.app_config.load_task_config()
         self.log_relay = LogRelay()
         self.log_relay.message.connect(self._append_log)
@@ -60,6 +63,7 @@ class MainWindow(QMainWindow):
         self._build()
         self._connect()
         self.settings_page.load_config(self.task_config)
+        self._report_data_dir()
         self._update_status('请先设置任务，然后点击"扫描文件"。')
 
     # ================================================================ 构建
@@ -172,6 +176,13 @@ class MainWindow(QMainWindow):
     def _append_log(self, text: str) -> None:
         self.result_page.append_log(text)
 
+    def _report_data_dir(self) -> None:
+        """数据目录被回退时，在日志面板里说清楚，免得用户找不到历史记录。"""
+        note = file_utils.data_dir_note()
+        if note:
+            self._append_log(f'[提示] {note}')
+            self._append_log(f'[提示] 当前数据目录：{file_utils.get_app_data_dir()}')
+
     # ================================================================ 扫描
 
     def on_scan(self) -> None:
@@ -228,7 +239,11 @@ class MainWindow(QMainWindow):
         self.scan_page.show_result(result, self.manager.template_text,
                                    self.task_config.output.output_dir)
         self._goto(1)
-        self._update_status(f'扫描完成：找到 {result.count} 个匹配文件')
+        if getattr(result, 'canceled', False):
+            self._update_status(f'扫描已取消：保留 {result.count} 个已找到的文件')
+            self._append_log(f'[取消] 扫描中途取消，保留 {result.count} 个已找到的文件')
+        else:
+            self._update_status(f'扫描完成：找到 {result.count} 个匹配文件')
         self.manager.save_to_db('scanned')
         self.database.update_task(self.manager.task_id, total=result.count)
 
@@ -242,6 +257,8 @@ class MainWindow(QMainWindow):
         self.settings_page.set_busy(False)
         self.scan_page.set_busy(False)
         self.ocr_page.set_busy(False)
+        if self.result_page.running:
+            self.result_page.finish_with_error('任务失败', '任务已中止，详见日志。')
         self._update_status('任务失败')
         QMessageBox.critical(self, '任务失败', message)
 
@@ -258,6 +275,8 @@ class MainWindow(QMainWindow):
         self.ocr_page.refresh_records()
         self._goto(2)
         self.ocr_page.set_busy(True)
+        self.ocr_page.clear_degrade()
+        self._degrade_seen = ''
         self.ocr_page.start_progress(len(records), '正在加载 OCR 引擎…')
         self._update_status('正在进行本地 OCR 识别（图片不会离开本机）…')
 
@@ -269,6 +288,7 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _on_ocr_progress(self, event) -> None:
+        self._sync_degrade_banner()
         self.ocr_page.set_progress(event.current, event.total,
                                    f'{event.current}/{event.total} '
                                    f'{os.path.basename(event.source or "")}')
@@ -298,6 +318,7 @@ class MainWindow(QMainWindow):
 
     def _on_ocr_done(self, summary) -> None:
         was_canceled = bool(self.worker is not None and self.worker.canceled)
+        self._sync_degrade_banner()
         self.ocr_page.set_busy(False)
         self.ocr_page.end_progress('已强制停止' if was_canceled else '识别完成')
         self.ocr_page.reset_stop_button()
@@ -557,6 +578,7 @@ class MainWindow(QMainWindow):
         if not self._idle():
             QMessageBox.information(self, '请稍候', '当前任务尚未结束。')
             return
+        self._release_manager()
         self.scan_page.model.set_records([])
         self.ocr_page.model.set_records([])
         self.result_page.log_view.clear()
@@ -564,6 +586,32 @@ class MainWindow(QMainWindow):
         self._update_status('已返回设置页，可开始新任务。')
 
     # ================================================================ 辅助
+
+    def _release_manager(self) -> None:
+        """释放上一轮任务的引擎与日志句柄。
+
+        进程池常驻时，一个 TaskManager 会带着多个 OCR 子进程（每个几百 MB）
+        和打开的日志文件。以前只有"重新扫描"会 close 它，点"新任务"则一直挂着（P2-9）。
+        """
+        manager, self.manager = self.manager, None
+        if manager is None:
+            return
+        try:
+            manager.close()
+        except Exception as exc:      # 释放失败不应阻止开新任务
+            self._append_log(f'[警告] 释放上一轮任务资源失败：{exc}')
+        self.scan_page.set_manager(None)
+        self.ocr_page.set_manager(None)
+
+    def _sync_degrade_banner(self) -> None:
+        """OCR 期间若发生过降级，把原因常驻显示在 OCR 页顶部（P1-4）。"""
+        manager = self.manager
+        reason = getattr(manager, 'degraded_reason', '') if manager is not None else ''
+        if not reason or reason == self._degrade_seen:
+            return
+        self._degrade_seen = reason
+        self.ocr_page.show_degrade(reason)
+        self._append_log(f'[降级] {reason}')
 
     def _idle(self) -> bool:
         """当前是否没有正在运行的后台任务。"""
@@ -594,7 +642,7 @@ class MainWindow(QMainWindow):
                                     f'没有写入权限：\n{probe}')
                 return False
 
-        if os.path.abspath(output) == os.path.abspath(root):
+        if file_utils.same_path(output, root):
             QMessageBox.warning(self, '输出目录不合法', '输出目录不能与根目录相同。')
             return False
 
@@ -779,7 +827,14 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self.worker.cancel()
-            self.worker.wait(5000)
+            if not self.worker.wait(5000):
+                # 线程仍在结束当前文件（大文件复制无法中途打断，进程内 OCR 同理）。
+                # 此时若继续关库、关引擎，线程会写入已关闭的资源，所以保持窗口，等它真正结束。
+                QMessageBox.information(
+                    self, '正在收尾',
+                    '后台任务仍在结束当前文件，请稍候几秒后再次关闭窗口。')
+                event.ignore()
+                return
 
         if self.manager is not None:
             try:

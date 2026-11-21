@@ -198,16 +198,20 @@ def get_engine(prefer: str = 'auto', force_reload: bool = False,
                 return engine
 
         # 自动：按优先级取第一个可用的
+        # 缓存键必须带上模型路径。以前这里写的是裸键（key），于是"用自定义模型
+        # 跑过一次"之后，普通 auto 调用会命中那颗自定义模型的引擎（P2-16）。
         for key in _ENGINE_ORDER:
-            if key in _cache and not force_reload:
-                return _cache[key]
+            entry_key = (f'{key}:{rec_model_path}:{det_model_path}'
+                         if (rec_model_path or det_model_path) else key)
+            if entry_key in _cache and not force_reload:
+                return _cache[entry_key]
             try:
                 engine = _create_engine(key, rec_model_path, det_model_path)
             except Exception as exc:
                 logger.warning('引擎 %s 初始化失败：%s', key, exc)
                 continue
             if type(engine).is_available():
-                _cache[key] = engine
+                _cache[entry_key] = engine
                 logger.info('已选择 OCR 引擎：%s', engine.display_name)
                 return engine
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import time
 from typing import Iterable
 
@@ -20,6 +21,17 @@ from utils import file_utils
 from utils.logger import get_logger
 
 logger = get_logger('report')
+
+#: XML/openpyxl 不接受的控制字符（OCR 原文里偶尔会混进 \x0b 之类）
+#: 不清理的话 sheet.append 会抛 IllegalCharacterError，整份 xlsx 直接不生成。
+_ILLEGAL_XLSX_CHARS = re.compile('[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
+
+def excel_safe(value):
+    """把单元格值清理成 openpyxl 可接受的形式。"""
+    if not isinstance(value, str):
+        return value
+    return _ILLEGAL_XLSX_CHARS.sub('', value)
 
 #: 报告列定义：(表头, 记录取值函数)
 COLUMNS = [
@@ -158,7 +170,7 @@ class ReportManager:
                 cell.alignment = Alignment(horizontal='center', vertical='center')
 
             for row in self.build_rows(records):
-                sheet.append([row.get(header, '') for header, _ in COLUMNS])
+                sheet.append([excel_safe(row.get(header, '')) for header, _ in COLUMNS])
 
             widths = [6, 52, 14, 22, 40, 16, 10, 9, 30, 46, 10, 24, 10, 24]
             for i, width in enumerate(widths, start=1):

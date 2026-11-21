@@ -220,7 +220,14 @@ class RecordTableModel(QAbstractTableModel):
             return True
 
         if role == Qt.ItemDataRole.EditRole and column.key == 'final_filename':
+            # 必须走与对话框相同的清洗：手工名可能带 ".."、绝对路径或非法字符，
+            # 而这条路径以前是直接写进记录的。
+            from core.filename_manager import sanitize_manual_name
             text = str(value or '').strip()
+            if text:
+                text, note = sanitize_manual_name(text)
+                if note:
+                    record.conflict_note = note
             if text != record.final_filename:
                 record.final_filename = text
                 record.manual_override = bool(text)
