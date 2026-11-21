@@ -98,7 +98,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon=os.path.join(PROJECT_ROOT, 'packaging', 'app.ico'),  # 有图标时取消注释
+    icon=os.path.join(PROJECT_ROOT, 'PicHarvest.ico'),
 )
 
 coll = COLLECT(

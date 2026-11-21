@@ -12,7 +12,7 @@ import os
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame,
                                QGridLayout, QGroupBox, QHBoxLayout,
-                               QLabel, QLineEdit, QMessageBox,
+                               QHeaderView, QLabel, QLineEdit, QMessageBox,
                                QPlainTextEdit, QProgressBar, QPushButton,
                                QScrollArea, QSplitter, QTableView,
                                QVBoxLayout, QWidget)
@@ -129,18 +129,23 @@ class OcrPage(QWidget):
         self.proxy = RecordFilterProxy(self.model)
         configure_table_view(self.table, self.model, self.proxy.proxy, row_height=28)
         self.table.selectionModel().currentRowChanged.connect(self._on_row_changed)
-        # 列宽固定（见 widgets.OCR_COLUMNS），窗口不够宽时用横向滚动条，
-        # 不再让中间列被 Stretch 压成一条窄缝。
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.horizontalHeader().setMinimumSectionSize(48)
+        # 列宽见 widgets.OCR_COLUMNS。让「OCR 结果」这一列吸收剩余宽度：
+        # 窗口变窄时先压它，表格就不会冒出横向滚动条；窗口变宽时它变宽，
+        # 正好用来显示更长的 OCR 文本。
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(40)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         splitter.addWidget(self.table)
 
         detail = self._build_detail()
-        detail.setMinimumWidth(360)
+        # 440 是「识别与命名」表单的硬下限：五个按钮一排就要 432px。
+        detail.setMinimumWidth(440)
         splitter.addWidget(detail)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-        splitter.setSizes([880, 380])
+        # 右侧占 1/3、表格占 2/3：窗口变宽时按这个比例一起长。
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([1200, 600])
         layout.addWidget(splitter, 1)
 
         # 输出目录：跑完 OCR 才发现选错位置时，在这里直接改，不用重来
@@ -183,21 +188,26 @@ class OcrPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.preview = ImagePreview(title='原图预览')
+        # 预览吃掉右侧剩下的所有高度，但不设高下限：窗口变矮时它先缩，
+        # 保证下面的「识别与命名」表单永远完整显示，不需要滚动条。
+        self.preview.view.setMinimumSize(260, 110)
         layout.addWidget(self.preview, 1)
 
         group = QGroupBox('识别与命名')
         form = QGridLayout(group)
-        form.setContentsMargins(12, 10, 12, 10)
+        # 表单走紧凑排版：这一栏的高度是从预览图那里让出来的，行距能省则省。
+        form.setContentsMargins(10, 6, 10, 6)
         form.setHorizontalSpacing(8)
-        form.setVerticalSpacing(6)
+        form.setVerticalSpacing(4)
         form.setColumnMinimumWidth(0, 78)
         form.setColumnStretch(1, 1)
 
         form.addWidget(QLabel('OCR 结果：'), 0, 0, 1, 2)
         self.ocr_text_edit = QPlainTextEdit()
         self.ocr_text_edit.setReadOnly(True)
-        self.ocr_text_edit.setMinimumHeight(56)
-        self.ocr_text_edit.setMaximumHeight(110)
+        # OCR 原文只是核对用，压到三行左右，把高度让给上面的预览图。
+        self.ocr_text_edit.setMinimumHeight(44)
+        self.ocr_text_edit.setMaximumHeight(60)
         self.ocr_text_edit.setPlaceholderText('（未识别到文字）')
         form.addWidget(self.ocr_text_edit, 1, 0, 1, 2)
 

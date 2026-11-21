@@ -321,6 +321,11 @@ def main(argv: list[str] | None = None) -> int:
     logger.info('=' * 60)
     logger.info('程序启动')
 
+    from utils import file_utils as _file_utils
+    _data_note = _file_utils.data_dir_note()
+    if _data_note:
+        logger.warning('%s；当前数据目录：%s', _data_note, _file_utils.get_app_data_dir())
+
     install_excepthook()
 
     app = QApplication(argv if argv is not None else sys.argv)

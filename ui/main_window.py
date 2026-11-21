@@ -47,7 +47,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle('图片智能提取与 OCR 命名工具')
         self.resize(1360, 880)
-        self.setMinimumSize(1080, 700)
+        # 下限按「OCR 与命名」页算：右侧细节栏最窄要放得下五个按钮（≈440），
+        # 左边表格还要塞下固定列宽，窗口再窄就只能出滚动条了。
+        self.setMinimumSize(1180, 700)
 
         self.app_config = get_config()
         self.database = get_database()
@@ -61,6 +63,7 @@ class MainWindow(QMainWindow):
         self._build()
         self._connect()
         self.settings_page.load_config(self.task_config)
+        self._report_data_dir()
         self._update_status('请先设置任务，然后点击"扫描文件"。')
 
     # ================================================================ 构建
@@ -172,6 +175,13 @@ class MainWindow(QMainWindow):
 
     def _append_log(self, text: str) -> None:
         self.result_page.append_log(text)
+
+    def _report_data_dir(self) -> None:
+        """数据目录被回退时，在日志面板里说清楚，免得用户找不到历史记录。"""
+        note = file_utils.data_dir_note()
+        if note:
+            self._append_log(f'[提示] {note}')
+            self._append_log(f'[提示] 当前数据目录：{file_utils.get_app_data_dir()}')
 
     # ================================================================ 扫描
 

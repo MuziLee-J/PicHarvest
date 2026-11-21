@@ -12,9 +12,15 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 COPY_CHUNK = 1024 * 512
+
+#: 解析后的数据目录缓存；空串表示还没解析
+_DATA_DIR_CACHE = ''
+#: 数据目录发生回退时的说明（正常为空串）
+_DATA_DIR_NOTE = ''
 
 #: 图片扩展名集合（用于快速过滤）
 IMAGE_EXTENSIONS = {
@@ -59,12 +65,103 @@ def exists(path: str | os.PathLike) -> bool:
         return False
 
 
+def _seed_from_default_dir(target: str) -> None:
+    """数据目录回退时，尽量把原目录里的历史和配置带过来（只补缺失文件）。"""
+    local = os.environ.get('LOCALAPPDATA') or ''
+    if not local:
+        return
+    source = os.path.join(local, 'PicHarvest')
+    try:
+        if os.path.abspath(source) == os.path.abspath(target) or not os.path.isdir(source):
+            return
+    except (OSError, ValueError):
+        return
+    for name in ('history.db', 'config.json'):
+        src_file = os.path.join(source, name)
+        dst_file = os.path.join(target, name)
+        try:
+            if os.path.isfile(dst_file) or not os.path.isfile(src_file):
+                continue
+            shutil.copy2(to_long_path(src_file), to_long_path(dst_file))
+        except OSError:
+            continue
+
+
+def _temp_dir() -> str:
+    """系统临时目录（不抛异常）。"""
+    try:
+        return tempfile.gettempdir()
+    except (OSError, ValueError):
+        return os.path.expanduser('~')
+
+
+def _is_writable_dir(path: str) -> bool:
+    """目录能否真正写入（建目录 + 建删一个探测文件）。"""
+    try:
+        os.makedirs(to_long_path(path), exist_ok=True)
+        probe = os.path.join(path, f'.write_probe_{os.getpid()}')
+        with open(to_long_path(probe), 'w', encoding='utf-8') as fh:
+            fh.write('ok')
+        os.remove(to_long_path(probe))
+        return True
+    except OSError:
+        return False
+
+
+def program_dir() -> str:
+    """程序自身所在目录（打包后是 exe 目录，源码运行是 PicHarvest 目录）。"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def data_dir_note() -> str:
+    """数据目录发生回退时的说明；正常情况返回空串。"""
+    return _DATA_DIR_NOTE
+
+
 def get_app_data_dir() -> str:
-    """应用数据目录（日志 / 数据库 / 配置）。"""
-    base = os.environ.get('LOCALAPPDATA') or os.environ.get('APPDATA')
-    if not base:
-        base = os.path.expanduser('~')
-    return ensure_dir(os.path.join(base, 'PicHarvest'))
+    """应用数据目录（日志 / 数据库 / 配置）。
+
+    正常用 %LOCALAPPDATA%\\PicHarvest。若该目录不可写（系统策略、杀毒
+    软件、沙箱、权限被改），依次回退到 %APPDATA%、程序目录下的
+    userdata、临时目录，保证程序能启动而不是直接报
+    ``sqlite3.OperationalError: unable to open database file``。
+    也可用环境变量 PICHARVEST_DATA_DIR 显式指定。
+    """
+    global _DATA_DIR_CACHE, _DATA_DIR_NOTE
+    if _DATA_DIR_CACHE:
+        return _DATA_DIR_CACHE
+
+    candidates: list[tuple[str, str]] = []
+    override = (os.environ.get('PICHARVEST_DATA_DIR') or '').strip()
+    if override:
+        candidates.append((os.path.abspath(override), '按环境变量 PICHARVEST_DATA_DIR 指定'))
+    local = os.environ.get('LOCALAPPDATA')
+    roaming = os.environ.get('APPDATA')
+    if local:
+        candidates.append((os.path.join(local, 'PicHarvest'), ''))
+    if roaming:
+        candidates.append((os.path.join(roaming, 'PicHarvest'),
+                           f'{os.path.join(local or "本地数据目录", "PicHarvest")} 无法写入，已改用漫游目录'))
+    candidates.append((os.path.join(program_dir(), 'userdata', 'PicHarvest'),
+                       '系统用户数据目录无法写入，已改用程序目录下的 userdata'))
+    candidates.append((os.path.join(_temp_dir(), 'PicHarvest'),
+                       '系统用户数据目录与程序目录都无法写入，已改用临时目录（重启后可能丢失）'))
+
+    note = ''
+    for path, candidate_note in candidates:
+        if _is_writable_dir(path):
+            _DATA_DIR_CACHE = path
+            _DATA_DIR_NOTE = candidate_note
+            if candidate_note:
+                _seed_from_default_dir(path)
+            return path
+        if not note:
+            note = f'数据目录无法写入（{path}）'
+    # 全部失败：退回主目录，让调用方拿到明确的异常。
+    _DATA_DIR_NOTE = note
+    return ensure_dir(os.path.join(os.path.expanduser('~'), 'PicHarvest'))
 
 
 def get_log_dir() -> str:
