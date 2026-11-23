@@ -21,10 +21,15 @@ from dataclasses import dataclass
 
 from models import ImageRecord, NamingConfig, OutputConfig, Status
 from utils import file_utils
-from utils.validators import fit_path_length, sanitize_stem, split_extension
+from utils.validators import (fit_path_length, is_safe_filename, sanitize_filename,
+                              sanitize_stem, split_extension)
 
 #: 冲突后缀与主名之间的连接符
 CONFLICT_SUFFIX_SEP = '-'
+#: 连接符里禁止出现的字符（Windows 非法字符 + 路径分隔符）
+FORBIDDEN_SEPARATOR_CHARS = frozenset(':<>"/|?*' + chr(92))
+#: 连接符的最大长度（再长就没有"连接"的意义了）
+MAX_SEPARATOR_LEN = 8
 #: 单个目录最多尝试的冲突次数
 MAX_CONFLICT_TRY = 10000
 
@@ -44,25 +49,57 @@ class AllocationResult:
 
 # ---------------------------------------------------------------- 名称拼接
 
+def sanitize_separator(separator: str, fallback: str = '_') -> str:
+    """清洗名称连接符。
+
+    连接符会原样插进文件名，还会被当作 `re.sub` 的替换串，所以必须保证
+    不含路径分隔符与其它 Windows 非法字符——否则要么拼出子目录，要么让
+    `re.sub` 把反斜杠当转义序列而整批失败。
+    """
+    cleaned = ''.join(ch for ch in (separator or '')
+                      if ch not in FORBIDDEN_SEPARATOR_CHARS)
+    cleaned = cleaned.strip()[:MAX_SEPARATOR_LEN]
+    return cleaned or fallback
+
+
+def sanitize_manual_name(filename: str,
+                         max_stem_len: int = 100) -> tuple[str, str]:
+    """清洗用户手工输入的完整文件名。返回 (可用文件名, 修正说明)。
+
+    修正说明为空表示原样可用。空输入返回空串，由调用方决定是否取消人工名。
+    """
+    filename = (filename or '').strip()
+    if not filename:
+        return '', ''
+    safe, reason = is_safe_filename(filename)
+    if safe:
+        return filename, ''
+    cleaned = sanitize_filename(filename, '_', max_stem_len)
+    if cleaned == filename:
+        return filename, ''
+    return cleaned, f'文件名已自动修正：{reason}'
+
+
 def sanitize_pure_name(name: str, naming: NamingConfig) -> str:
     """清洗 OCR 得到的纯名称（此时还不含来源前缀）。"""
     return sanitize_stem(
         name,
-        replacement=naming.separator or '_',
+        replacement=sanitize_separator(naming.separator),
         max_len=max(20, naming.max_stem_len),
     )
 
 
 def sanitize_source(source_folder: str, naming: NamingConfig) -> str:
     """清洗来源文件夹名（作为文件名的一部分）。"""
-    return sanitize_stem(source_folder, replacement=naming.separator or '_', max_len=40)
+    return sanitize_stem(source_folder, replacement=sanitize_separator(naming.separator),
+                         max_len=40)
 
 
 def compose_base_stem(pure_name: str, source_folder: str, naming: NamingConfig) -> str:
     """拼接文件名主干（不含扩展名、不含冲突后缀）。"""
     name = sanitize_pure_name(pure_name, naming)
     source = sanitize_source(source_folder, naming) if (naming.keep_source and source_folder) else ''
-    sep = naming.separator or '_'
+    sep = sanitize_separator(naming.separator)
 
     if not source:
         return name
@@ -243,8 +280,15 @@ def resolve_filenames(records: list[ImageRecord],
         record.suggested_filename = desired
 
         if record.manual_override and record.final_filename:
-            desired = fit_path_length(dest_dir, record.final_filename) \
-                if dest_dir else record.final_filename
+            # 实测：表格双击入口曾经绕过清洗，直接把带 ".." 或绝对路径的字符串
+            # 交给落盘代码。这里再兜一次，任何入口进来都要先过同一把尺子。
+            cleaned, note = sanitize_manual_name(record.final_filename,
+                                                 naming.max_stem_len)
+            if cleaned != record.final_filename:
+                record.final_filename = cleaned
+                if note:
+                    record.conflict_note = note
+            desired = fit_path_length(dest_dir, cleaned) if dest_dir else cleaned
 
         if not desired:
             record.status = Status.NEEDS_REVIEW

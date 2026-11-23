@@ -146,7 +146,9 @@ class ScanPage(QWidget):
         self.records = result.files
         self.model.set_records(self.records)
         self.preview.clear()
-        self.count_label.setText(f'找到 {result.count} 个文件')
+        self.count_label.setText(
+            f'已取消，保留 {result.count} 个已找到的文件' if result.canceled
+            else f'找到 {result.count} 个文件')
 
         lines = [
             f'<b>根目录：</b>{result.root_dir}',
@@ -156,6 +158,9 @@ class ScanPage(QWidget):
             f'<b>访问目录：</b>{result.scanned_dirs} 个　'
             f'<b>耗时：</b>{result.elapsed:.2f} 秒',
         ]
+        if result.canceled:
+            lines.append('<span style="color:#c47f0a">扫描被取消，下面是取消前已经找到的文件；'
+                         '未遍历到的目录没有包含在内。</span>')
         if result.errors:
             lines.append(f'<span style="color:#c47f0a">扫描中有 {len(result.errors)} 处警告'
                          f'（通常是权限或临时文件），已跳过，不影响结果。</span>')

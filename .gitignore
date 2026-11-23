@@ -53,3 +53,6 @@ desktop.ini
 # ---------------------------------------------------------------------------
 config.local.json
 *.local
+
+# 程序数据目录回退时使用（见 utils/file_utils.get_app_data_dir）
+userdata/

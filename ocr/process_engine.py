@@ -281,8 +281,11 @@ class ProcessOcrEngine(OcrEngine):
 
     def force_stop(self) -> bool:
         """强制终止子进程（立即生效）。返回是否确实杀掉了进程。"""
-        self._stopped = True
+        # _stopped 必须在锁内置位：start() 会在锁内把它清成 False，
+        # 若在这里锁外写，就可能被"正在启动"的那一轮 start() 覆盖掉，
+        # 于是启动等待会一直熬到 startup_timeout（P2-5）。
         with self._lifecycle_lock:
+            self._stopped = True
             alive = self.is_alive()
             self._kill_locked()
             return alive

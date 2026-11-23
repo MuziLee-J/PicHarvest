@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import unittest
 
 from core.scanner import ScanError, Scanner, count_only, preview_rule
@@ -145,6 +146,51 @@ class TestScanner(unittest.TestCase):
         result = Scanner(self.root, f'*/1440/{TARGET_NAME}').scan()
         self.assertEqual([r.source_folder for r in result.files],
                          ['CASE1', 'CASE2', 'CASE10'])
+
+
+class _CancelAfterFirstRecord(Scanner):
+    """第一条结果刚落袋就置取消位，模拟用户点「取消」。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cancel_event = threading.Event()
+
+    def _make_record(self, dir_path, parts, name):
+        record = super()._make_record(dir_path, parts, name)
+        self.cancel_event.set()
+        return record
+
+
+class TestScanCancel(unittest.TestCase):
+    """取消扫描时不能把已找到的结果丢掉（原来返回 0 条）。"""
+
+    def setUp(self):
+        self.tree = TempTree()
+        self.root = self.tree.__enter__()
+        self.addCleanup(lambda: self.tree.__exit__(None, None, None))
+        for folder in ('CASE001', 'CASE002', 'CASE003'):
+            write_file(os.path.join(self.root, folder, '1440', TARGET_NAME))
+
+    def _run(self, template):
+        scanner = _CancelAfterFirstRecord(self.root, template)
+        result = scanner.scan(cancel_event=scanner.cancel_event)
+        return result
+
+    def test_partial_results_are_kept_fixed_depth(self):
+        result = self._run(f'*/1440/{TARGET_NAME}')
+        self.assertTrue(result.canceled)
+        self.assertGreaterEqual(result.count, 1)
+        self.assertLess(result.count, 3)
+
+    def test_partial_results_are_kept_recursive(self):
+        result = self._run(f'**/1440/{TARGET_NAME}')
+        self.assertTrue(result.canceled)
+        self.assertGreaterEqual(result.count, 1)
+
+    def test_completed_scan_is_not_marked_canceled(self):
+        result = Scanner(self.root, f'*/1440/{TARGET_NAME}').scan()
+        self.assertFalse(result.canceled)
+        self.assertEqual(result.count, 3)
 
 
 if __name__ == '__main__':

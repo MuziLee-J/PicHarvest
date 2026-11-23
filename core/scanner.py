@@ -85,9 +85,11 @@ class Scanner:
             else:
                 records = self._scan_fixed_depth(state)
         except _ScanCanceled:
-            pass
-        else:
-            result.files = records
+            # 取消也要留住已经找到的结果：以前这里直接 pass，几千个文件扫到
+            # 一半点取消，界面会显示"找到 0 个"，白扫一场。
+            records = state.collected
+            result.canceled = True
+        result.files = list(records)
 
         result.files.sort(key=lambda r: natural_key(r.rel_path))
         for i, rec in enumerate(result.files, start=1):
@@ -132,7 +134,7 @@ class Scanner:
             if not level:
                 break
 
-        records: list[ImageRecord] = []
+        records: list[ImageRecord] = state.collected
         for dir_path, parts in level:
             if state.should_stop():
                 raise _ScanCanceled()
@@ -149,7 +151,7 @@ class Scanner:
 
     def _scan_recursive(self, state: '_ScanState') -> list[ImageRecord]:
         """含 ** 时：遍历整棵树，再对每条相对路径做模板匹配。"""
-        records: list[ImageRecord] = []
+        records: list[ImageRecord] = state.collected
         visited: set = set()
         stack: list[tuple[str, tuple, int]] = [(self.root_dir, (), 0)]
         file_seg = self.template.segments[-1]
@@ -295,6 +297,7 @@ class _ScanState:
         self.cancel_event = cancel_event
         self.dirs = 0
         self.errors: list[tuple[str, str]] = []
+        self.collected: list[ImageRecord] = []   # 取消时用来保住部分结果
         self._last_report = 0
 
     def tick(self, current_dir: str, found: int) -> None:
