@@ -607,6 +607,21 @@ class TaskManager:
 
     # ================================================================ 命名
 
+    def _preview_filename(self, record: ImageRecord) -> str:
+        """按当前名称算一个"预览用"的最终文件名（不做重名分配）。"""
+        from core.filename_manager import compute_final_filename
+
+        output_dir = self.config.output.output_dir or ''
+        dest_dir = ''
+        if output_dir:
+            dest_dir = record.dest_dir(output_dir,
+                                       self.config.output.keep_structure)
+        try:
+            return compute_final_filename(record, self.config.naming, dest_dir)
+        except Exception as exc:          # 预览失败不能影响改名本身
+            logger.warning('预览文件名计算失败：%s', exc)
+            return record.extracted_name or ''
+
     def set_manual_name(self, record: ImageRecord, name: str,
                         remember: bool = True) -> None:
         """人工指定名称（采用）。
@@ -616,14 +631,29 @@ class TaskManager:
         """
         name = (name or '').strip()
         previous = (record.extracted_name or '').strip()
+        was_skipped = (record.status == Status.SKIPPED)
 
         record.extracted_name = name
         record.extract_method = ExtractMethod.MANUAL
         record.extract_reason = '人工确认/修改'
         record.manual_override = True
-        record.status = Status.READY if record.extracted_name else Status.NEEDS_REVIEW
-        if record.status == Status.READY:
-            record.error = None
+
+        # 名字变了，之前算好的最终文件名就必须作废：
+        # resolve_filenames 里 "manual_override 且 final_filename 非空" 的分支
+        # 会直接沿用旧名字，导致复制出来的还是改名前的文件。
+        if name != previous:
+            record.final_filename = ''
+            record.conflict = False
+            record.conflict_note = ''
+        record.suggested_filename = self._preview_filename(record)
+
+        # 已跳过的记录改名后仍然跳过，要恢复得点「恢复」
+        if was_skipped:
+            record.status = Status.SKIPPED
+        else:
+            record.status = Status.READY if record.extracted_name else Status.NEEDS_REVIEW
+            if record.status == Status.READY:
+                record.error = None
 
         if remember and name and name != previous and record.ocr_text:
             self.remember_correction(record, previous, name)
